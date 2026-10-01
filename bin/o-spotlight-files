@@ -1,0 +1,270 @@
+#!/usr/bin/python3 -IS
+# O-Spotlight's file access, all of it in one place.
+#
+# Every file O-Spotlight reads or writes goes through here, so each is reached
+# the same careful way: from "/" one directory at a time without following
+# symbolic links, through directories that only their owner (you, or root) can
+# write to, to a regular file with a single link, owned by you (Omarchy's own
+# files: by root), no bigger than a fixed size. Nothing is followed, nothing
+# is read past its cap, and nothing is read whole into memory first.
+#
+# The history is replaced atomically: written to a new file created
+# exclusively beside it, synced, then renamed over it. Its folder is created
+# (0700) inside your home folder or your runtime folder only.
+#
+# Usage (O-Spotlight runs it as /usr/bin/python3 -I -S <this file> ...):
+#   o-spotlight-files read <name>           print one of the files in FILES
+#   o-spotlight-files history-read <dir>    print <dir>/history.json
+#   o-spotlight-files history-write <dir>   replace <dir>/history.json with stdin
+#
+# Exit status: 0 done, 2 usage, 3 the file isn't there, 4 refused (why, on
+# stderr).
+
+import errno
+import json
+import os
+import pwd
+import secrets
+import stat
+import sys
+
+KIB = 1024
+MIB = 1024 * KIB
+
+OMARCHY = "/usr/share/omarchy"
+
+# name: (whose, where, the most it may be)
+#   "root": Omarchy's own file, root's from "/" down
+#   "home": in your home folder, yours
+FILES = {
+    "launcher-hides": ("root", OMARCHY + "/default/omarchy/launcher.hides", 64 * KIB),
+    "menu": ("root", OMARCHY + "/default/omarchy/omarchy-menu.jsonc", 1 * MIB),
+    "user-menu": ("home", ".config/omarchy/extensions/omarchy-menu.jsonc", 1 * MIB),
+    "theme-name": ("home", ".local/state/omarchy/current/theme.name", 4 * KIB),
+    "recent": ("home", ".local/share/recently-used.xbel", 4 * MIB),
+    "clipboard": ("home", ".local/state/omarchy/clipboard-history.json", 8 * MIB),
+}
+
+HISTORY = "history.json"
+HISTORY_CAP = 2 * MIB
+
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK | os.O_NOCTTY
+
+
+class Refused(Exception):
+    pass
+
+
+class Missing(Exception):
+    pass
+
+
+def uid():
+    return os.getuid()
+
+
+def home():
+    # From the password database, not $HOME.
+    return pwd.getpwuid(uid()).pw_dir.rstrip("/") or "/"
+
+
+def runtime_dir():
+    return "/run/user/%d" % uid()
+
+
+def clean_absolute(path):
+    """The path, if it's absolute and plain: no "." or ".." or empty parts."""
+    if not isinstance(path, str) or not path.startswith("/") or "\0" in path or len(path) > 4096:
+        raise Refused("not an absolute path")
+    parts = path.split("/")[1:]
+    if path != "/" and any(p in ("", ".", "..") for p in parts):
+        raise Refused("not a plain path")
+    return path
+
+
+def check_dir(fd, path, owners):
+    st = os.fstat(fd)
+    if not stat.S_ISDIR(st.st_mode):
+        raise Refused("%s: not a directory" % path)
+    if st.st_uid not in owners:
+        raise Refused("%s: owned by someone else" % path)
+    if st.st_mode & 0o022:
+        raise Refused("%s: others can write to it" % path)
+
+
+def open_dir(path, owners, create_below=None):
+    """Open the directory at `path`, one component at a time from "/" without
+    following symbolic links; every directory on the way must belong to one
+    of `owners` and be writable by no one else. Missing directories below
+    `create_below` are created, 0700 and yours."""
+    path = clean_absolute(path)
+    fd = os.open("/", DIR_FLAGS)
+    try:
+        check_dir(fd, "/", owners)
+        current = ""
+        for name in ([] if path == "/" else path.split("/")[1:]):
+            current += "/" + name
+            try:
+                child = os.open(name, DIR_FLAGS, dir_fd=fd)
+            except FileNotFoundError:
+                if create_below is None or not current.startswith(create_below + "/"):
+                    raise Missing(current)
+                os.mkdir(name, 0o700, dir_fd=fd)
+                child = os.open(name, DIR_FLAGS, dir_fd=fd)
+            except OSError as e:
+                if e.errno in (errno.ELOOP, errno.ENOTDIR):
+                    raise Refused("%s: not a real directory" % current)
+                raise
+            os.close(fd)
+            fd = child
+            check_dir(fd, current, owners)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def read_file(dir_fd, name, path, owners, cap):
+    """The file's bytes: a regular file with one link, belonging to one of
+    `owners`, writable by no one else, at most `cap` bytes."""
+    try:
+        fd = os.open(name, FILE_FLAGS, dir_fd=dir_fd)
+    except FileNotFoundError:
+        raise Missing(path)
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            raise Refused("%s: a symbolic link" % path)
+        raise
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise Refused("%s: not a regular file" % path)
+        if st.st_uid not in owners:
+            raise Refused("%s: owned by someone else" % path)
+        if st.st_nlink != 1:
+            raise Refused("%s: has more than one link" % path)
+        if st.st_mode & 0o022:
+            raise Refused("%s: others can write to it" % path)
+        if st.st_size > cap:
+            raise Refused("%s: bigger than %d bytes" % (path, cap))
+        chunks = []
+        total = 0
+        while True:
+            chunk = os.read(fd, min(64 * KIB, cap + 1 - total))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > cap:
+                raise Refused("%s: bigger than %d bytes" % (path, cap))
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def owners_for(whose):
+    return {0} if whose == "root" else {0, uid()}
+
+
+def read_named(name):
+    if name not in FILES:
+        raise Refused("unknown file %r" % name)
+    whose, where, cap = FILES[name]
+    path = where if whose == "root" else home() + "/" + where
+    folder, _, leaf = path.rpartition("/")
+    fd = open_dir(folder, owners_for(whose))
+    try:
+        return read_file(fd, leaf, path, {0} if whose == "root" else {uid()}, cap)
+    finally:
+        os.close(fd)
+
+
+def history_base(folder):
+    """The folder the history may live in: inside your home folder or your
+    runtime folder, nowhere else."""
+    folder = clean_absolute(folder)
+    for base in (home(), runtime_dir()):
+        if folder.startswith(base + "/"):
+            return base
+    raise Refused("%s: not in your home or runtime folder" % folder)
+
+
+def history_read(folder):
+    history_base(folder)
+    fd = open_dir(folder, owners_for("home"))
+    try:
+        return read_file(fd, HISTORY, folder + "/" + HISTORY, {uid()}, HISTORY_CAP)
+    finally:
+        os.close(fd)
+
+
+def history_write(folder, data):
+    if len(data) > HISTORY_CAP:
+        raise Refused("history: bigger than %d bytes" % HISTORY_CAP)
+    try:
+        value = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise Refused("history: not JSON")
+    if not isinstance(value, dict):
+        raise Refused("history: not a JSON object")
+    base = history_base(folder)
+    fd = open_dir(folder, owners_for("home"), create_below=base)
+    try:
+        if os.fstat(fd).st_uid != uid():
+            raise Refused("%s: owned by someone else" % folder)
+        temp = ".%s.%s.tmp" % (HISTORY, secrets.token_hex(8))
+        out = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=fd)
+        try:
+            view = memoryview(data)
+            while view:
+                view = view[os.write(out, view):]
+            os.fsync(out)
+        except BaseException:
+            os.close(out)
+            os.unlink(temp, dir_fd=fd)
+            raise
+        os.close(out)
+        try:
+            os.rename(temp, HISTORY, src_dir_fd=fd, dst_dir_fd=fd)
+        except BaseException:
+            os.unlink(temp, dir_fd=fd)
+            raise
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def read_stdin(cap):
+    data = sys.stdin.buffer.read(cap + 1)
+    if len(data) > cap:
+        raise Refused("input: bigger than %d bytes" % cap)
+    return data
+
+
+def main(argv):
+    if len(argv) != 3 or argv[1] not in ("read", "history-read", "history-write"):
+        sys.stderr.write("usage: o-spotlight-files read <name> | history-read <dir> | history-write <dir>\n")
+        return 2
+    command, arg = argv[1], argv[2]
+    try:
+        if command == "read":
+            sys.stdout.buffer.write(read_named(arg))
+        elif command == "history-read":
+            sys.stdout.buffer.write(history_read(arg))
+        else:
+            history_write(arg, read_stdin(HISTORY_CAP))
+        sys.stdout.flush()
+        return 0
+    except Missing:
+        return 3
+    except Refused as e:
+        sys.stderr.write("o-spotlight-files: %s\n" % e)
+        return 4
+    except OSError as e:
+        sys.stderr.write("o-spotlight-files: %s\n" % (e.strerror or e))
+        return 4
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

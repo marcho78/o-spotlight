@@ -1,0 +1,13 @@
+#!/bin/bash
+# Runs every test suite. Needs node, lua and python3.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+node tests/match.test.cjs
+node tests/calc.test.cjs
+node tests/menu.test.cjs
+node tests/files.test.cjs
+node tests/rank.test.cjs
+node tests/settings.test.cjs
+node tests/styles.test.cjs
+lua tests/hypr.test.lua
+/usr/bin/python3 -I tests/files-helper.test.py

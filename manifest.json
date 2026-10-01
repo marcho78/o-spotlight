@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "id": "marcho78.o-spotlight",
+  "name": "O-Spotlight",
+  "version": "1.0.0",
+  "author": "marcho78",
+  "license": "MIT",
+  "homepage": "https://github.com/marcho78/o-spotlight",
+  "description": "A Spotlight-style search for Omarchy. Find apps, Omarchy actions and settings, and files, and do quick math and conversions, from Alt+Space. 12 distinct themes, fully customizable.",
+  "kinds": [
+    "overlay",
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "overlay": "Spotlight.qml",
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "O-Spotlight",
+    "description": "O-Spotlight search. Click to search, right-click for settings.",
+    "category": "Search",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

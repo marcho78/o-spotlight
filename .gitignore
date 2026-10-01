@@ -1,0 +1,14 @@
+# Local only, never published: the development harness and notes (dev/),
+# caches, logs, editor folders, and anything private.
+dev/
+__pycache__/
+*.pyc
+*.log
+*.bak
+*.swp
+*~
+.env
+.env.*
+.DS_Store
+.idea/
+.vscode/
