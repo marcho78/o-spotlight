@@ -229,7 +229,8 @@ overlay that draws the search on the focused display, and the icon in the bar.
   git-ignored files skipped, like Spotlight skips system files), and from
   `localsearch search` for contents. One `stat` fills in sizes and dates.
   Pictures of files are the thumbnails Files already made, or the image
-  itself; O-Spotlight never writes thumbnails.
+  itself, once `stat` has said it's a regular file of a sane size;
+  O-Spotlight never writes thumbnails.
 * **Everything is ranked together**: how well the name matches (from the start
   of a word, as in Spotlight, never scattered letters), what kind of thing it
   is (apps first), and what you've opened before. Results that arrive later
@@ -264,10 +265,10 @@ through a shell, except the two bash runs noted below:
 
 | Program | Why |
 |---|---|
-| `/usr/bin/python3 -I -S` with `bin/o-spotlight-files` | every file O-Spotlight reads or writes (see **Files**) |
-| `/usr/bin/fd` | find file and folder names under your home folder |
+| `/usr/bin/python3 -I -S` with `bin/o-spotlight-files` | every file O-Spotlight reads or writes, apart from the pictures it shows (see **Files** and **Pictures**) |
+| `/usr/bin/fd` | find file and folder names under your home folder (files and folders only: no links, pipes or devices) |
 | `/usr/bin/localsearch` | find documents by their contents (`localsearch search`) |
-| `/usr/bin/stat` | sizes and dates of the files on screen and of recent files, and which thumbnails Files already made for them |
+| `/usr/bin/stat` | sizes and dates of the files on screen and of recent files; whether each picture is a regular file of a sane size before it's shown (see **Pictures**) |
 | `/usr/bin/find` | list your themes |
 | `/usr/bin/bash` | run Omarchy's own `shell/services/hidden-entries.sh` from `/usr/share/omarchy`, and the Omarchy menu's `when:`/`checked:` checks (see below) |
 | `/usr/bin/hyprctl` | read Hyprland's bindings; register and remove the shortcut and rules; bring the settings window forward |
@@ -276,16 +277,20 @@ through a shell, except the two bash runs noted below:
 | `/usr/bin/omarchy-shell` | open a top bar panel (`shell summon omarchy.network`), and say "Copied" on the OSD when Return copies an answer |
 | `/usr/bin/omarchy-clipboard-paste-text`, `/usr/bin/omarchy-clipboard-paste-file` | paste or copy a Clipboard view item, as Omarchy's clipboard does |
 | `/usr/bin/gdbus` | show a file in Files (`org.freedesktop.FileManager1.ShowItems`) |
-| `/usr/bin/wl-copy` | copy a path or an answer |
+| `/usr/bin/wl-copy` | copy a path or an answer, handed over on its stdin (never in its command line, where other accounts could read it) |
 | `/usr/bin/readlink` | find your wallpaper (`~/.local/state/omarchy/current/background`) for the settings window's preview |
 
 Program paths are fixed in the code, never taken from `PATH` or other
 environment variables. Every call whose output O-Spotlight reads starts under
-`/usr/bin/setsid`, so it is its own process group. Its output is counted as it
-arrives against a fixed budget (4 KiB to 8 MiB depending on the call) and each
-has a deadline of 2 to 8 seconds; going over either ends the whole group with
-`/usr/bin/kill`. A search that's still running when you type on is stopped the
-same way.
+`/usr/bin/setsid`, so it is its own process group. Its output is counted in
+bytes as it arrives against a fixed budget (8 KiB to 24 MiB depending on the
+call) and each has a deadline of 2 to 8 seconds; going over either ends the
+whole group with `/usr/bin/kill`. A search that's still running when you type
+on is stopped the same way, and so is anything still running when O-Spotlight
+is turned off. Output is taken in so that no character is split: the file
+helper prints only ASCII, and `fd`'s paths (NUL-ended) and the lines of
+`stat`, `find`, `readlink` and Omarchy's hidden-apps script arrive one whole
+record at a time, each at most a path long.
 
 **The menu's checks.** The Omarchy menu hides some rows and marks others with
 shell tests in its menu files (`when:` and `checked:`, such as "is Docker
@@ -293,11 +298,16 @@ installed"). To show the same rows, O-Spotlight runs those tests in one bash
 batch built by Omarchy's own recipe (`MenuModel.guardScript`), which reports
 only yes or no per row. The tests come from the menu files only; nothing you
 type and no result ever reaches them. Omarchy's own rows (from its root-owned
-`/usr/share/omarchy` menu file) run with no startup files and `PATH=/usr/bin`.
-Rows from your own `~/.config/omarchy/extensions/omarchy-menu.jsonc` run the
-way the Omarchy menu runs them (a login shell, your `PATH`), since they call
-your own tools; they're your configuration, and the Omarchy menu runs them
-whenever it opens.
+`/usr/share/omarchy` menu file) run with no startup files, in a fresh
+environment: `PATH=/usr/bin`, `OMARCHY_PATH=/usr/share/omarchy`, and of yours
+only what the tests read (home, user, language, XDG folders and session,
+Wayland and D-Bus addresses), so no exported function or shell option of
+yours comes along. Omarchy's hidden-apps script runs the same way. Rows from
+your own `~/.config/omarchy/extensions/omarchy-menu.jsonc` run the way the
+Omarchy menu runs them (a login shell, your `PATH`), since they call your own
+tools; they're your configuration, and the Omarchy menu runs every row that
+way each time it opens. A test longer than 8 KiB isn't run at all (never cut
+short), and its row stays hidden; each menu file is read up to 5,000 rows.
 
 **What it passes along.** Your query reaches `fd` and `localsearch` as
 separate arguments after `--`, so it can never be read as an option. Omarchy
@@ -305,22 +315,28 @@ menu ids, theme names, app ids, panel ids and file paths are checked against
 plain-character patterns before they're used; paths must be absolute with no
 control characters, and a file URI for Files has every special character
 escaped. Web searches are percent-encoded, and only http and https addresses
-are opened.
+are opened; an address you type with a control character in it isn't one.
 
-**Files.** `bin/o-spotlight-files` does all of O-Spotlight's file access. It
-reaches every file from `/` one directory at a time without following
-symbolic links, through directories only their owner can write to, and reads
-only a regular file with a single link, owned by you (Omarchy's own files: by
-root), and no bigger than a fixed cap, read in pieces up to that cap. Anything
-else is refused.
+**Files.** `bin/o-spotlight-files` does all of O-Spotlight's reading and
+writing of files, apart from the pictures it shows (below). It reaches every
+file from `/` one directory at a time without following symbolic links,
+through directories only their owner can write to, and reads only a regular
+file with a single link, owned by you (Omarchy's own files: by root), and no
+bigger than a fixed cap, read in pieces up to that cap. Anything else is
+refused. What it read reaches the shell as one escaped JSON string, plain
+ASCII.
 
 * **It writes one file:** `~/.local/state/marcho78.o-spotlight/history.json`,
-  what you've opened (and whether you've seen the welcome), at most 4 MiB. It
-  writes a new file created exclusively beside it, syncs it, then renames it
-  over the old one; the folder is created only you can open (0700), and the
-  file only you can read (0600). Turn off **Learn from what I open** to stop
-  recording and **Clear history** to empty it. Your last searches (↑) are
-  kept only in memory.
+  at most 8 MiB: what you've opened, how often and when, and the first 40
+  characters of the searches you opened each from (so that search finds it
+  first next time), and whether you've seen the welcome. It writes a new file
+  created exclusively beside it, syncs it, then renames it over the old one;
+  the folder is created only you can open (0700), and the file only you can
+  read (0600). The temp file of a write that was stopped is removed a minute
+  later. Nothing is written until the file has been read (or found missing),
+  so a read that fails never costs you your history. Turn off **Learn from
+  what I open** to stop recording and **Clear history** to empty it. Your
+  last searches (↑) are kept only in memory.
 * **It reads, without changing:**
   * Omarchy's menu, at most 1 MiB, and `launcher.hides`, at most 64 KiB, both
     root's, from `/usr/share/omarchy/default/omarchy`;
@@ -329,11 +345,18 @@ else is refused.
   * the current theme's name, `~/.local/state/omarchy/current/theme.name`;
   * your recent files list, `~/.local/share/recently-used.xbel`, at most 4 MiB;
   * the Omarchy clipboard history,
-    `~/.local/state/omarchy/clipboard-history.json`, at most 8 MiB, only for
-    the Clipboard view and never mixed into search results.
-* **Pictures** it shows are the thumbnails Files already made in
-  `~/.cache/thumbnails`, images among your results, clipboard images and your
-  wallpaper, each decoded at the size it's shown.
+    `~/.local/state/omarchy/clipboard-history.json`, at most 8 MiB, only when
+    the Clipboard view is shown and again right before an item is pasted or
+    copied from it (Omarchy's paste goes by the item's place in the history,
+    so it's looked up at the last moment); never mixed into search results.
+* **Pictures** are opened by Qt, by their path: the thumbnails Files already
+  made in `~/.cache/thumbnails`, images among your results, theme previews,
+  clipboard images, icons that apps name by path, and your wallpaper. None
+  reaches Qt until `stat` has said it's a regular file (not a link, a pipe or
+  a device) no bigger than its cap: 64 MiB, thumbnails 8 MiB, icons 4 MiB.
+  They're checked again every time the search opens, and each is decoded at
+  the size it's shown. Icons named by apps come from your icon theme, as
+  everywhere in the shell.
 * **Settings** are stored on O-Spotlight's entry in
   `~/.config/omarchy/shell.json` by the Omarchy shell.
 
@@ -352,7 +375,9 @@ Omarchy menu lands where it should.
 
 **Limits.** Like any shell plugin, O-Spotlight trusts the programs above and
 Omarchy's own files; anything already running as you could change its files
-or your Omarchy menu.
+or your Omarchy menu, or swap a picture for something else between its check
+and its loading (at worst stalling picture loading, which such a program
+could do anyway).
 
 ## Development
 
@@ -376,7 +401,10 @@ at all).
   their layouts have no grid. The Island stays black whatever the colors;
   only its accent follows them.
 * Files O-Spotlight refuses to read (a symbolic link, say, or a recent files
-  list over 4 MiB) are simply left out, with a note in the shell's log.
+  list over 4 MiB) are simply left out, with a note in the shell's log. A
+  picture that isn't a regular file of a sane size (a link, say) shows as its
+  file's icon instead. Symbolic links, pipes and devices aren't search
+  results; the files and folders they point to are.
 * No Quick Look (Space): Omarchy has no quick previewer. Space types a space.
 * LocalSearch indexes what GNOME's indexer is set to index, and skips folders
   that contain a `.git` folder; file *names* there are still found by `fd`.
@@ -390,11 +418,12 @@ omarchy plugin remove marcho78.o-spotlight
 ```
 
 The shortcut and rules leave Hyprland with it, and its settings go with its
-shell.json entry. To also forget what it learned, delete its one file and
-then its folder:
+shell.json entry. To also forget what it learned, delete its file (and the
+temp file of a save that was stopped part way, if there is one), then its
+folder:
 
 ```bash
-rm ~/.local/state/marcho78.o-spotlight/history.json
+rm -f ~/.local/state/marcho78.o-spotlight/history.json ~/.local/state/marcho78.o-spotlight/.history.json.*.tmp
 rmdir ~/.local/state/marcho78.o-spotlight
 ```
 

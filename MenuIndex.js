@@ -25,10 +25,14 @@ function own(object, key) {
 
 // ---- reading the menu --------------------------------------------------------------
 
+// Comment lines out, and the commas JSON doesn't allow before } or ]. Line
+// by line: a pattern spanning lines can take time that grows with the square
+// of a run of blank lines.
 function stripJsonc(raw) {
-  return String(raw || "")
-    .replace(/^\s*\/\/[^\n]*(\n|$)/gm, "")
-    .replace(/,(\s*[}\]])/g, "$1")
+  var lines = String(raw || "").split("\n")
+  var kept = []
+  for (var i = 0; i < lines.length; i++) if (!/^\s*\/\//.test(lines[i])) kept.push(lines[i])
+  return kept.join("\n").replace(/,(\s*[}\]])/g, "$1")
 }
 
 function normalizeAliases(value) {
@@ -39,6 +43,22 @@ function normalizeAliases(value) {
 
 function text(value, limit) {
   return typeof value === "string" ? value.slice(0, limit || 200) : ""
+}
+
+// Rows read from one menu file, at most (Omarchy's has about 300).
+var MAX_ITEMS = 5000
+
+// A `when:` or `checked:` longer than this isn't run at all: cut short, it
+// could be a different command. Its row doesn't show, or shows unchecked.
+// (Omarchy's longest is about 110 characters.)
+var MAX_GUARD = 8192
+
+function guardText(value) {
+  return typeof value === "string" && value.length <= MAX_GUARD ? value : ""
+}
+
+function tooLong(value) {
+  return typeof value === "string" && value.length > MAX_GUARD
 }
 
 function normalizeItem(id, raw) {
@@ -59,8 +79,9 @@ function normalizeItem(id, raw) {
     description: text(value.description, 300),
     provider: text(value.provider, 64),
     aliases: normalizeAliases(value.aliases).slice(0, 16),
-    when: text(value.when, 2000),
-    checked: text(value.checked, 2000)
+    when: guardText(value.when),
+    whenTooLong: tooLong(value.when),
+    checked: guardText(value.checked)
   }
 }
 
@@ -77,6 +98,7 @@ function parse(raw) {
   var source = parsed.items && typeof parsed.items === "object" && !Array.isArray(parsed.items) ? parsed.items : parsed
   var out = []
   for (var id in source) {
+    if (out.length >= MAX_ITEMS) break
     var entry = source[id]
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue
     if (id.length > 200) continue
@@ -246,22 +268,39 @@ function hasProviderAncestor(items, id) {
   return false
 }
 
-// Visible unless its own `when:` or an ancestor's failed; a static submenu also
-// needs something visible inside it.
-function isVisible(merged, guards, id, depth) {
+// Visible unless its own `when:` or an ancestor's failed (or its `when:` is
+// too long to run); a static submenu also needs something visible inside it.
+// Worked out for the whole menu at once, each row once.
+function visibility(merged, guards) {
   var items = merged.items
-  var entry = items[id]
-  if (!entry || (depth || 0) > 32) return false
   var when = guards && guards.when ? guards.when : {}
-  if (entry.when && when[id] === false) return false
-  var list = ancestors(items, id)
-  for (var i = 0; i < list.length; i++) if (list[i].when && when[list[i].id] === false) return false
-  if (entry.kind !== "menu" || entry.provider) return true
+  var children = table()
   for (var j = 0; j < merged.order.length; j++) {
     var child = items[merged.order[j]]
-    if (child && child.parent === id && isVisible(merged, guards, child.id, (depth || 0) + 1)) return true
+    if (!child) continue
+    if (!children[child.parent]) children[child.parent] = []
+    children[child.parent].push(child.id)
   }
-  return false
+  var known = table()
+  function visible(id, depth) {
+    if (known[id] !== undefined) return known[id]
+    // Settled as hidden first, so a menu that contains itself ends here, as
+    // does one nested deeper than any real menu.
+    known[id] = false
+    if (depth > 32) return false
+    var entry = items[id]
+    if (!entry || entry.whenTooLong || (entry.when && when[id] === false)) return false
+    var list = ancestors(items, id)
+    for (var i = 0; i < list.length; i++) {
+      if (list[i].whenTooLong || (list[i].when && when[list[i].id] === false)) return false
+    }
+    var result = entry.kind !== "menu" || !!entry.provider
+    var inside = children[id] || []
+    for (var k = 0; !result && k < inside.length; k++) result = visible(inside[k], depth + 1)
+    known[id] = result
+    return result
+  }
+  return visible
 }
 
 // Every result the menu offers, with what search needs to find it.
@@ -269,12 +308,13 @@ function entries(merged, guards) {
   var out = []
   var items = merged.items
   var checked = guards && guards.checked ? guards.checked : {}
+  var isVisible = visibility(merged, guards)
   for (var i = 0; i < merged.order.length; i++) {
     var id = merged.order[i]
     var item = items[id]
     if (!item || id === "root" || item.provider === "apps") continue
     if (hasProviderAncestor(items, id)) continue
-    if (!isVisible(merged, guards, id)) continue
+    if (!isVisible(id, 0)) continue
     var chain = ancestors(items, id)
     var path = chain.map(function(a) { return a.title || a.label }).join(" › ")
     var top = chain.length ? chain[0].id : id

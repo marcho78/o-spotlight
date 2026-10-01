@@ -46,10 +46,37 @@ Item {
     return ["/usr/bin/python3", "-I", "-S", filesHelper].concat(args)
   }
 
+  // The helper prints what it read as one JSON string, plain ASCII (so it
+  // can be taken in as it arrives): the text, and the most it prints for a
+  // file of up to `cap` bytes (it refuses text needing more).
+  function helperText(output) {
+    var raw = String(output || "").trim()
+    if (!raw) return ""
+    try {
+      var text = JSON.parse(raw)
+      return typeof text === "string" ? text : ""
+    } catch (e) {
+      return ""
+    }
+  }
+  function helperBudget(cap) {
+    return 3 * cap + 1024
+  }
+
   // For the two scripts O-Spotlight runs through bash (Omarchy's own: see
-  // hiddenRun and guardRun): Omarchy's commands from /usr/bin only, and no
-  // startup file of yours.
-  readonly property var shellEnvironment: ({ PATH: "/usr/bin", BASH_ENV: null, ENV: null })
+  // hiddenRun and guardRun): a fresh environment, with Omarchy's commands
+  // from /usr/bin only, and of yours only what Omarchy's checks read (your
+  // home, language and desktop session); null takes the value O-Spotlight
+  // has. Nothing else comes along: no startup file, exported function or
+  // shell option of yours.
+  readonly property var shellEnvironment: ({
+    PATH: "/usr/bin", OMARCHY_PATH: omarchyDir,
+    HOME: null, USER: null, LOGNAME: null, LANG: null, LC_ALL: null, LC_CTYPE: null, LC_MESSAGES: null,
+    TERMINAL: null, XDG_CONFIG_HOME: null, XDG_DATA_HOME: null, XDG_STATE_HOME: null, XDG_CACHE_HOME: null,
+    XDG_CONFIG_DIRS: null, XDG_DATA_DIRS: null, XDG_RUNTIME_DIR: null, XDG_CURRENT_DESKTOP: null,
+    XDG_SESSION_DESKTOP: null, XDG_SESSION_TYPE: null, DESKTOP_SESSION: null, WAYLAND_DISPLAY: null,
+    DISPLAY: null, HYPRLAND_INSTANCE_SIGNATURE: null, DBUS_SESSION_BUS_ADDRESS: null
+  })
 
   // ---- what you typed, and what it found ---------------------------------------------
 
@@ -133,7 +160,9 @@ Item {
     readLauncherHides()
     readMenus()
     refreshThemes()
-    readClipboard()
+    recheckPictures()
+    if (mode === "clipboard") readClipboard()
+    if (!historyReadOk) readHistory()
   }
 
   // ---- apps ----------------------------------------------------------------------------
@@ -199,10 +228,10 @@ Item {
     id: hidesRun
     okCodes: [0, 3]
     timeoutMs: 3000
-    maxBytes: 68 * 1024
+    maxBytes: engine.helperBudget(64 * 1024)
     onFinished: function(ok, output) {
       if (!ok) console.warn("O-Spotlight:", output)
-      engine.launcherHides = ok ? engine.idSet(output) : Object.create(null)
+      engine.launcherHides = ok ? engine.idSet(engine.helperText(output)) : Object.create(null)
       appsDebounce.restart()
     }
   }
@@ -217,6 +246,8 @@ Item {
     id: hiddenRun
     timeoutMs: 8000
     maxBytes: 256 * 1024
+    splitMarker: "\n"
+    clearEnvironment: true
     environment: engine.shellEnvironment
     onFinished: function(ok, output) {
       if (!ok) return
@@ -225,12 +256,19 @@ Item {
     }
   }
 
-  function appIcon(icon) {
+  // An app's icon: from the icon theme, or a picture file the app names
+  // (shown once it's been checked; see Pictures).
+  function appIconFile(icon) {
     var value = String(icon || "")
-    if (value.charAt(0) === "/") return fileUrl(value)
-    if (value.indexOf("file://") === 0) return value
-    var themed = value ? Quickshell.iconPath(value, true) : ""
-    return themed || Quickshell.iconPath("application-x-executable", true)
+    if (value.indexOf("file://") === 0) value = Files.pathFromUri(value)
+    return value.charAt(0) === "/" && Files.goodPath(value) ? value : ""
+  }
+
+  function appIcon(icon) {
+    var file = appIconFile(icon)
+    var value = String(icon || "")
+    var found = file ? pictureUrl(file, iconCap) : (value ? Quickshell.iconPath(value, true) : "")
+    return found || Quickshell.iconPath("application-x-executable", true)
   }
 
   function rebuildApps() {
@@ -270,6 +308,7 @@ Item {
     }
     out.sort(function(a, b) { return a.title.toLowerCase().localeCompare(b.title.toLowerCase()) })
     apps = out
+    askPictures(appIconFiles())
     appCategories = categoryNames.filter(function(c) { return used[c.id] })
       .concat(used.other ? [{ id: "other", title: "Other" }] : [])
     if (active) rebuild(true)
@@ -299,6 +338,7 @@ Item {
 
   function rebuildMenu() {
     menuMerged = MenuIndex.merge(menuDefault, menuUser)
+    userMenuIds = MenuIndex.idsOf(menuUser)
     menuEntries = MenuIndex.entries(menuMerged, menuGuards)
     evaluateGuards()
     if (active) rebuild(true)
@@ -314,13 +354,13 @@ Item {
     id: menuRun
     okCodes: [0, 3]
     timeoutMs: 3000
-    maxBytes: 1028 * 1024
+    maxBytes: engine.helperBudget(1024 * 1024)
     onFinished: function(ok, output) {
       if (!ok) {
         console.warn("O-Spotlight:", output)
         return
       }
-      engine.menuDefault = MenuIndex.parse(output)
+      engine.menuDefault = MenuIndex.parse(engine.helperText(output))
       menuDebounce.restart()
     }
   }
@@ -329,10 +369,10 @@ Item {
     id: userMenuRun
     okCodes: [0, 3]
     timeoutMs: 3000
-    maxBytes: 1028 * 1024
+    maxBytes: engine.helperBudget(1024 * 1024)
     onFinished: function(ok, output) {
       if (!ok) console.warn("O-Spotlight:", output)
-      engine.menuUser = ok ? MenuIndex.parse(output) : []
+      engine.menuUser = ok ? MenuIndex.parse(engine.helperText(output)) : []
       menuDebounce.restart()
     }
   }
@@ -348,15 +388,17 @@ Item {
   // MenuModel.guardScript, as MenuIndex.guardScript), so both show the same
   // rows. They're the menu's tests, from its files; none of O-Spotlight's own
   // data reaches them. Two batches:
-  //   - Omarchy's rows (root's menu file): no startup files, and Omarchy's
-  //     commands from /usr/bin only.
-  //   - Rows from your own menu file: as the Omarchy menu runs them, a login
-  //     shell with your PATH, since they call your own tools.
+  //   - Omarchy's rows (root's menu file): no startup files, and the fresh
+  //     environment above (Omarchy's commands from /usr/bin only).
+  //   - Rows from your own menu file: as the Omarchy menu runs them (all of
+  //     its rows, on every open), a login shell with your PATH, since they
+  //     call your own tools.
   property var ownGuards: null
   property var userGuards: null
   property bool ownGuardsAgain: false
   property bool userGuardsAgain: false
-  readonly property var userMenuIds: MenuIndex.idsOf(menuUser)
+  // Set with the merged menu (rebuildMenu), so both batches split it the same way.
+  property var userMenuIds: Object.create(null)
 
   function evaluateGuards() {
     evaluateOwnGuards()
@@ -401,6 +443,7 @@ Item {
     id: guardRun
     timeoutMs: 8000
     maxBytes: 256 * 1024
+    clearEnvironment: true
     environment: engine.shellEnvironment
     onFinished: function(ok, output) {
       if (ok) engine.setGuards(MenuIndex.parseGuards(output), engine.userGuards)
@@ -441,10 +484,10 @@ Item {
     id: themeNameRun
     okCodes: [0, 3]
     timeoutMs: 3000
-    maxBytes: 8 * 1024
+    maxBytes: engine.helperBudget(4 * 1024)
     onFinished: function(ok, output) {
       if (!ok) console.warn("O-Spotlight:", output)
-      engine.currentTheme = ok ? String(output).trim().slice(0, 64) : ""
+      engine.currentTheme = ok ? engine.helperText(output).trim().slice(0, 64) : ""
     }
   }
 
@@ -453,9 +496,11 @@ Item {
     okCodes: [0, 1]
     timeoutMs: 3000
     maxBytes: 64 * 1024
+    splitMarker: "\n"
     onFinished: function(ok, output) {
       if (!ok) return
       engine.themeEntries = MenuIndex.themeEntries(output, engine.currentTheme)
+      engine.askPictures(engine.themeEntries.map(function(t) { return t.preview }))
       if (engine.active) engine.rebuild(true)
     }
   }
@@ -520,6 +565,8 @@ Item {
     id: fileRun
     timeoutMs: 2500
     maxBytes: 2 * 1024 * 1024
+    // fd prints NUL-ended paths (--print0): taken in one whole path at a time.
+    splitMarker: "\u0000"
     onFinished: function(ok, output) {
       engine.fileResults = ok ? Files.parseFd(output, engine.excluded, engine.home) : []
       engine.fileQuery = engine.pendingFileQuery
@@ -581,7 +628,7 @@ Item {
     }
     if (wanted.length === 0) return
     metaRun.hashes = hashes
-    metaRun.replace(["/usr/bin/stat", "-c", "%Y\t%s\t%F\t%n", "--"].concat(wanted))
+    metaRun.replace(["/usr/bin/stat", "-c", Files.STAT_FORMAT, "--"].concat(wanted))
   }
 
   Run {
@@ -589,7 +636,8 @@ Item {
     property var hashes: []
     okCodes: [0, 1]
     timeoutMs: 2000
-    maxBytes: 512 * 1024
+    maxBytes: 2 * 1024 * 1024
+    splitMarker: "\n"
     onFinished: function(ok, output) {
       var stats = Files.parseStat(output)
       var meta = {}
@@ -600,8 +648,9 @@ Item {
       for (var h in engine.thumbChecked) checked[h] = true
       for (var p in stats) {
         if (p.indexOf(engine.thumbDir) === 0) {
+          // Only a thumbnail that's a regular file of a sane size is used.
           var m = p.slice(engine.thumbDir.length).match(/^(x-large|large|normal)\/([0-9a-f]{32})\.png$/)
-          if (m) index[m[1] + "/" + m[2]] = true
+          if (m && Files.pictureOk(stats[p], engine.thumbnailCap)) index[m[1] + "/" + m[2]] = true
         } else {
           meta[p] = stats[p]
         }
@@ -633,15 +682,15 @@ Item {
     id: recentRun
     okCodes: [0, 3]
     timeoutMs: 3000
-    maxBytes: 4100 * 1024
+    maxBytes: engine.helperBudget(4 * 1024 * 1024)
     onFinished: function(ok, output) {
       if (!ok) console.warn("O-Spotlight:", output)
-      var recent = ok ? Files.parseRecent(output, 40) : []
+      var recent = ok ? Files.parseRecent(engine.helperText(output), 40) : []
       if (recent.length === 0) {
         engine.recentFiles = []
         return
       }
-      statRun.start(["/usr/bin/stat", "-c", "%Y\t%s\t%F\t%n", "--"].concat(recent.map(function(r) { return r.path })))
+      statRun.start(["/usr/bin/stat", "-c", Files.STAT_FORMAT, "--"].concat(recent.map(function(r) { return r.path })))
     }
   }
 
@@ -650,6 +699,7 @@ Item {
     okCodes: [0, 1]
     timeoutMs: 2000
     maxBytes: 256 * 1024
+    splitMarker: "\n"
     onFinished: function(ok, output) {
       var stats = Files.parseStat(output)
       var out = []
@@ -725,19 +775,53 @@ Item {
 
   property var clipboardItems: []
 
+  // Read when the Clipboard view is shown, and again right before an item is
+  // pasted or copied: the history changes under the view (a copy moves an
+  // item to the top), and Omarchy's paste takes an item by its place in it.
   function readClipboard() {
-    clipboardRun.start(filesCommand(["read", "clipboard"]))
+    if (settings.clipboard === false) return
+    if (!clipboardRun.start(filesCommand(["read", "clipboard"]))) clipboardRun.again = true
+  }
+
+  // Runs `then(ok)` once the history has been read afresh.
+  function withFreshClipboard(then) {
+    clipboardRun.waiting = clipboardRun.waiting.concat([then])
+    if (clipboardRun.running) clipboardRun.again = true
+    else clipboardRun.start(filesCommand(["read", "clipboard"]))
   }
 
   Run {
     id: clipboardRun
+    // Asked for again while a read was running, which may predate the change.
+    property bool again: false
+    property var waiting: []
     okCodes: [0, 3]
     timeoutMs: 3000
-    maxBytes: 8196 * 1024
+    maxBytes: engine.helperBudget(8 * 1024 * 1024)
     onFinished: function(ok, output) {
       if (!ok) console.warn("O-Spotlight:", output)
-      engine.loadClipboard(ok ? output : "[]")
+      engine.loadClipboard(ok ? engine.helperText(output) : "[]")
+      if (clipboardRun.again) {
+        clipboardRun.again = false
+        Qt.callLater(function() { clipboardRun.start(engine.filesCommand(["read", "clipboard"])) })
+        return
+      }
+      var waiting = clipboardRun.waiting
+      clipboardRun.waiting = []
+      waiting.forEach(function(then) { then(ok) })
     }
+  }
+
+  // After a copy from the view, Omarchy's clipboard moves the item to the
+  // top a moment later: the view follows.
+  Timer {
+    id: clipboardFollow
+    interval: 400
+    onTriggered: if (engine.active && engine.mode === "clipboard") engine.readClipboard()
+  }
+
+  function clipboardCopied() {
+    clipboardFollow.restart()
   }
 
   function loadClipboard(raw) {
@@ -754,6 +838,7 @@ Item {
       }
     }
     clipboardItems = out
+    askPictures(out.filter(function(item) { return item.type === "image" }).map(function(item) { return item.path }))
     if (active && mode === "clipboard") rebuild(true)
   }
 
@@ -781,14 +866,23 @@ Item {
     id: historyReadRun
     okCodes: [0, 3]
     timeoutMs: 3000
-    maxBytes: 4100 * 1024
+    maxBytes: engine.helperBudget(8 * 1024 * 1024)
     onFinished: function(ok, output) {
-      if (!ok) console.warn("O-Spotlight: history:", output)
-      engine.history = ok ? Frecency.parse(output) : Frecency.empty()
+      if (ok) {
+        engine.history = Frecency.parse(engine.helperText(output))
+      } else {
+        // Kept as it is, and not written over (see writeHistory) until it's
+        // been read: asked for again the next time the window opens.
+        console.warn("O-Spotlight: history:", output)
+      }
+      engine.historyReadOk = ok
       engine.historyLoaded = true
     }
   }
 
+  // True once the history file has been read (or found missing): until then
+  // nothing is written, so a read that failed never costs you your history.
+  property bool historyReadOk: false
   property bool saveAgain: false
 
   function saveHistory() {
@@ -796,6 +890,7 @@ Item {
   }
 
   function writeHistory() {
+    if (!historyReadOk) return
     if (historyWriteRun.running) {
       saveAgain = true
       return
@@ -1165,7 +1260,7 @@ Item {
       row.subtitle = "Omarchy · Top bar"
     } else if (c.source === "theme") {
       row.iconType = "thumb"
-      row.iconSource = fileUrl(c.preview)
+      row.iconSource = pictureUrl(c.preview, pictureCap)
       row.checked = !!c.checked
       row.subtitle = c.checked ? "Omarchy theme · Current" : "Omarchy theme"
       row.action = "Apply"
@@ -1182,9 +1277,13 @@ Item {
       row.folder = file.parent === home ? "Home" : file.parent.split("/").pop()
       row.path = pathText(file.parent)
     } else if (c.source === "clipboard") {
-      if (c.clip.type === "image") {
+      var clipPicture = c.clip.type === "image" ? pictureUrl(c.clip.path, pictureCap) : ""
+      if (clipPicture) {
         row.iconType = "thumb"
-        row.iconSource = fileUrl(c.clip.path)
+        row.iconSource = clipPicture
+      } else if (c.clip.type === "image") {
+        row.symbol = "image"
+        row.badge = "#8e8e93"
       } else {
         row.symbol = c.url ? "globe" : "text"
         row.badge = c.url ? "#0a84ff" : "#8e8e93"
@@ -1197,8 +1296,9 @@ Item {
   }
 
   // Pictures to try for a file, in order: thumbnails Files already made (the
-  // freedesktop thumbnail cache), then, for an image, the image itself. The
-  // window shows the first that loads, else the file's icon.
+  // freedesktop thumbnail cache), then, for an image, the image itself. Each
+  // only once `stat` has said it's a regular file of a sane size. The window
+  // shows the first that loads, else the file's icon.
   function thumbnailUrls(file) {
     if (file.isDir || !previewable(file)) return []
     var hash = Qt.md5(Files.thumbnailUri(file.path))
@@ -1206,8 +1306,88 @@ Item {
     for (var i = 0; i < thumbSizes.length; i++) {
       if (thumbnailIndex[thumbSizes[i] + "/" + hash]) out.push(fileUrl(thumbDir + thumbSizes[i] + "/" + hash + ".png"))
     }
-    if (Files.isImage(file) && file.ext !== "svg") out.push(fileUrl(file.path))
+    if (Files.isImage(file) && file.ext !== "svg" && Files.pictureOk(fileMeta[file.path], pictureCap)) out.push(fileUrl(file.path))
     return out
+  }
+
+  // ---- pictures ------------------------------------------------------------------------------------
+  //
+  // Qt opens a picture by its path, and a path can name anything: a pipe
+  // would stall the shell's picture loading, a device or a huge file worse.
+  // So no picture reaches the window until `stat` has said it's a regular
+  // file (not a link) no bigger than its cap. Files in the results are
+  // checked with their sizes and dates (metaRun); these are the others:
+  // theme previews, clipboard images, icons apps name by path, and the
+  // wallpaper. Each is checked again every time the window opens.
+  readonly property real pictureCap: 64 * 1024 * 1024
+  readonly property real thumbnailCap: 8 * 1024 * 1024
+  readonly property real iconCap: 4 * 1024 * 1024
+  property var pictures: ({})
+  property var picturesAsked: []
+
+  function pictureUrl(path, cap) {
+    return Files.pictureOk(pictures[path], cap) ? fileUrl(path) : ""
+  }
+
+  function askPictures(paths) {
+    var add = []
+    for (var i = 0; i < paths.length; i++) {
+      var path = paths[i]
+      if (Files.goodPath(path) && picturesAsked.indexOf(path) < 0 && add.indexOf(path) < 0) add.push(path)
+    }
+    if (add.length === 0) return
+    picturesAsked = picturesAsked.concat(add)
+    pictureDebounce.restart()
+  }
+
+  function recheckPictures() {
+    askPictures(Object.keys(pictures))
+  }
+
+  function appIconFiles() {
+    var out = []
+    for (var i = 0; i < apps.length; i++) {
+      var file = appIconFile(apps[i].icon)
+      if (file) out.push(file)
+    }
+    return out
+  }
+
+  Timer {
+    id: pictureDebounce
+    interval: 20
+    onTriggered: {
+      if (pictureRun.running) {
+        pictureDebounce.restart()
+        return
+      }
+      var batch = engine.picturesAsked.slice(0, 400)
+      engine.picturesAsked = engine.picturesAsked.slice(batch.length)
+      pictureRun.batch = batch
+      pictureRun.start(["/usr/bin/stat", "-c", Files.STAT_FORMAT, "--"].concat(batch))
+    }
+  }
+
+  Run {
+    id: pictureRun
+    property var batch: []
+    okCodes: [0, 1]
+    timeoutMs: 3000
+    maxBytes: 2 * 1024 * 1024
+    splitMarker: "\n"
+    onFinished: function(ok, output) {
+      var stats = ok ? Files.parseStat(output) : {}
+      var next = {}
+      var keys = Object.keys(engine.pictures)
+      // Keep the list from growing without end.
+      if (keys.length < 2000) keys.forEach(function(k) { next[k] = engine.pictures[k] })
+      // Asked about: what `stat` said, and nothing (never shown) for what
+      // it couldn't see.
+      pictureRun.batch.forEach(function(path) { next[path] = stats[path] || null })
+      engine.pictures = next
+      if (engine.picturesAsked.length > 0) pictureDebounce.restart()
+      if (engine.active) engine.rebuild(true)
+    }
   }
 
   Component.onCompleted: {

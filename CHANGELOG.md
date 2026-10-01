@@ -4,6 +4,45 @@ Every notable change to O-Spotlight is listed here, newest first. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and version
 numbers follow [Semantic Versioning](https://semver.org/).
 
+## 1.0.1 - 2026-10-01
+
+Fixes from a security review before the marketplace submission.
+
+### Fixed
+
+- **Pictures are checked before Qt opens them.** A pipe named like an image
+  (some archives unpack them) could stall the shell's picture loading. Now no
+  picture is shown until `stat` has said it's a regular file no bigger than
+  its cap: file results and their thumbnails, theme previews, clipboard
+  images, icons apps name by path, and the wallpaper.
+- **File search lists files and folders only**, not links, pipes or devices.
+- **Clipboard view:** a paste or copy looks the item up in the history right
+  before Omarchy's paste reads it. A copy made while the view was open could
+  shift the history so the wrong item was pasted.
+- **Non-ASCII text** (file names, clipboard text, menu icons) can no longer
+  be garbled when a character's bytes arrive in two pieces.
+- **Recent files and menu files are read in linear time**: a crafted file
+  could keep the shell busy for minutes.
+- **The history is never written over after a failed read**, and a stopped
+  save no longer leaves its temp file behind.
+
+### Changed
+
+- Omarchy's own menu checks and its hidden-apps script run in a fresh
+  environment: `PATH=/usr/bin` and only the variables the checks read.
+- Copied text goes to `wl-copy` on its stdin, out of its command line.
+- The file helper hands files over as escaped JSON text (plain ASCII); the
+  history may be up to 8 MiB, above the most O-Spotlight keeps.
+- A menu check longer than 8 KiB isn't run (it was cut short); a menu file is
+  read up to 5,000 rows.
+- The clipboard history is read for the Clipboard view only, not on every
+  open.
+- Output budgets count bytes. Anything still running when O-Spotlight is
+  turned off is stopped.
+- Typed addresses with control characters aren't opened, and `HTTPS://` works.
+- The `set` and `browse` commands limit their input, and `status` no longer
+  reports what's typed.
+
 ## 1.0.0 - 2026-10-01
 
 The first version.

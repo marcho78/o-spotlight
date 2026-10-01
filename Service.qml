@@ -336,19 +336,41 @@ Item {
       return "close"
     }
     if (c.source === "clipboard") {
-      // Where the item is in the history now (a copy made meanwhile moves it).
-      var index = engine.clipboardIndex(c.clip)
-      if (c.clip.type === "text" && index < 0) return ""
+      var clip = c.clip
+      // An image goes by its file. Pasted into the window you came from, once
+      // the search is out of the way.
+      if (clip.type === "image") {
+        if (how === "copy") {
+          Quickshell.execDetached(["/usr/bin/omarchy-clipboard-paste-file", "--copy-only", clip.mime, clip.path])
+          engine.clipboardCopied()
+          return "stay"
+        }
+        later(["/usr/bin/omarchy-clipboard-paste-file", clip.mime, clip.path])
+        return "close"
+      }
+      // Text goes by its place in the history, which every copy since the
+      // view was read has moved: read the history afresh and find the item
+      // in it, right before Omarchy's paste reads it too. (For a paste, that's
+      // once the search has let go of the keyboard.)
+      var withIndex = function(run) {
+        engine.withFreshClipboard(function(ok) {
+          var index = ok ? engine.clipboardIndex(clip) : -1
+          if (index < 0) root.osd("󰅍", "No longer in your clipboard history")
+          else run(String(index))
+        })
+      }
       if (how === "copy") {
-        if (c.clip.type === "image") Quickshell.execDetached(["/usr/bin/omarchy-clipboard-paste-file", "--copy-only", c.clip.mime, c.clip.path])
-        else Quickshell.execDetached(["/usr/bin/omarchy-clipboard-paste-text", "--copy-only", "--history-index", String(index)])
+        withIndex(function(index) {
+          Quickshell.execDetached(["/usr/bin/omarchy-clipboard-paste-text", "--copy-only", "--history-index", index])
+          engine.clipboardCopied()
+        })
         return "stay"
       }
-      // Pasted into the window you came from, once the search is out of the way.
-      if (c.clip.type === "image")
-        later(["/usr/bin/omarchy-clipboard-paste-file", c.clip.mime, c.clip.path])
-      else
-        later(["/usr/bin/omarchy-clipboard-paste-text", "--shift-insert", "--history-index", String(index)])
+      later(function() {
+        withIndex(function(index) {
+          Quickshell.execDetached(["/usr/bin/omarchy-clipboard-paste-text", "--shift-insert", "--history-index", index])
+        })
+      })
       return "close"
     }
     return ""
@@ -378,11 +400,12 @@ Item {
   }
 
   // After the window has let go of the keyboard, so what runs lands in the
-  // window underneath (a paste) or opens on top (the Omarchy menu).
+  // window underneath (a paste) or opens on top (the Omarchy menu). `what`
+  // is a command (an argument list) or a function.
   property var laterQueue: []
 
-  function later(argv) {
-    laterQueue = laterQueue.concat([argv])
+  function later(what) {
+    laterQueue = laterQueue.concat([what])
     laterTimer.restart()
   }
 
@@ -392,14 +415,34 @@ Item {
     onTriggered: {
       var queue = root.laterQueue
       root.laterQueue = []
-      queue.forEach(function(argv) { Quickshell.execDetached(argv) })
+      queue.forEach(function(what) {
+        if (typeof what === "function") what()
+        else Quickshell.execDetached(what)
+      })
     }
   }
 
+  // On wl-copy's stdin, as Omarchy's own clipboard does it: as an argument,
+  // the text would sit in wl-copy's command line, where any account on the
+  // computer can read it, for as long as it holds the clipboard.
   function copyText(text) {
     var value = String(text || "")
     if (!value || value.length > 100000) return
-    Quickshell.execDetached(["/usr/bin/wl-copy", "--", value])
+    if (!copyRun.start(["/usr/bin/wl-copy"], value)) copyRun.next = value
+  }
+
+  Run {
+    id: copyRun
+    // Copied while the last copy was still being handed over: goes next.
+    property string next: ""
+    timeoutMs: 3000
+    maxBytes: 16 * 1024
+    onFinished: function(ok, output) {
+      if (!ok) console.warn("O-Spotlight: copying:", output)
+      var value = copyRun.next
+      copyRun.next = ""
+      if (value) Qt.callLater(function() { root.copyText(value) })
+    }
   }
 
   function reveal(path) {
@@ -418,15 +461,20 @@ Item {
   // ---- wallpaper (for the settings window's preview) ------------------------------------------
 
   property string wallpaper: ""
-  readonly property string wallpaperUrl: wallpaper ? Util.fileUrl(wallpaper) : ""
+  // Shown once checked like every other picture (Engine.qml, Pictures).
+  readonly property string wallpaperUrl: wallpaper ? engineItem.pictureUrl(wallpaper, engineItem.pictureCap) : ""
 
   Run {
     id: wallpaperRun
-    maxBytes: 4 * 1024
+    maxBytes: 8 * 1024
     timeoutMs: 2000
+    splitMarker: "\n"
     onFinished: function(ok, output) {
       var path = String(output || "").trim()
-      if (ok && /^\/[^\u0000-\u001f\u007f]{1,4000}$/.test(path)) root.wallpaper = path
+      if (ok && /^\/[^\u0000-\u001f\u007f]{1,4000}$/.test(path)) {
+        root.wallpaper = path
+        engineItem.askPictures([path])
+      }
     }
   }
 
@@ -475,11 +523,14 @@ Item {
     function show(): void { if (!root.windowOpen) root.show({}) }
     function hide(): void { root.hide() }
     function search(text: string): void { root.show({ query: String(text || "").slice(0, 500) }) }
-    function browse(view: string): void { root.show({ mode: String(view || "all") }) }
+    function browse(view: string): void { root.show({ mode: String(view || "all").slice(0, 32) }) }
     function settings(): void { root.openSettings("") }
     // omarchy-shell o-spotlight set glass frosted   (values are checked like the settings window's)
     function set(key: string, value: string): string {
-      if (!root.defaults || root.defaults[key] === undefined) return "unknown setting"
+      key = String(key || "")
+      value = String(value || "")
+      if (!root.defaults || !Object.prototype.hasOwnProperty.call(root.defaults, key)) return "unknown setting"
+      if (value.length > 64 * 1024) return "too long"
       var parsed = value
       if (value === "true" || value === "false") parsed = value === "true"
       else if (/^-?\d{1,6}$/.test(value)) parsed = Number(value)
@@ -495,7 +546,6 @@ Item {
         takenShortcuts: root.takenBinds,
         apps: root.engine.apps.length,
         connected: !!root.shell,
-        query: root.engine.query,
         mode: root.engine.mode,
         typing: !!root.ui && root.ui.typing,
         selected: root.ui ? root.ui.selectedIndex : -1,

@@ -26,8 +26,10 @@ function fdArgs(query, options) {
   options = options || {}
   var terms = searchTerms(query)
   if (terms.length === 0 || !options.root) return null
+  // Files and folders only: no links, pipes, sockets or devices.
   var argv = ["/usr/bin/fd", "--absolute-path", "--color=never", "--print0", "--ignore-case",
-              "--fixed-strings", "--max-results=" + Math.max(1, Math.min(2000, options.limit || 300))]
+              "--fixed-strings", "--type=f", "--type=d",
+              "--max-results=" + Math.max(1, Math.min(2000, options.limit || 300))]
   var excludes = DEFAULT_EXCLUDES.concat(options.excludes || [])
   for (var i = 0; i < excludes.length; i++) {
     var glob = excludes[i]
@@ -130,36 +132,63 @@ function parseLocalSearch(output, excludes, home) {
   return out
 }
 
-// Recently used files (~/.local/share/recently-used.xbel), newest first.
+// Recently used files (~/.local/share/recently-used.xbel), newest first. One
+// pass over the file: each <bookmark ...> tag is cut at its own ">" before
+// its attributes are looked at, so no tag can make the search run long.
+var HREF = /\shref="([^"]*)"/
+var MODIFIED = /\smodified="([^"]*)"/
+
+function xmlText(value) {
+  return value.replace(/&quot;/g, "\"").replace(/&apos;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&")
+}
+
 function parseRecent(xml, limit) {
   var out = []
-  var re = /<bookmark\b[^>]*?\bhref="([^"]*)"[^>]*?\bmodified="([^"]*)"/g
-  var m
   var seen = {}
-  var text = String(xml || "")
-  while ((m = re.exec(text)) !== null) {
-    var href = m[1].replace(/&amp;/g, "&").replace(/&apos;/g, "'").replace(/&quot;/g, "\"").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
-    var path = pathFromUri(href)
+  var parts = String(xml || "").split("<bookmark")
+  for (var i = 1; i < parts.length; i++) {
+    var part = parts[i]
+    // <bookmark:applications> and the like aren't bookmarks.
+    if (!/^\s/.test(part)) continue
+    var end = part.indexOf(">")
+    var tag = end >= 0 ? part.slice(0, end) : part
+    var href = HREF.exec(tag)
+    var modified = MODIFIED.exec(tag)
+    if (!href || !modified) continue
+    var path = pathFromUri(xmlText(href[1]))
     if (!goodPath(path) || seen[path] || /\/\./.test(path)) continue
     seen[path] = true
-    var when = Date.parse(m[2])
+    var when = Date.parse(xmlText(modified[1]))
     out.push({ path: path, time: isFinite(when) ? when : 0 })
   }
   out.sort(function(a, b) { return b.time - a.time })
   return out.slice(0, limit || 30)
 }
 
-// `stat -c '%Y\t%s\t%F\t%n'` output → { path: { time, size, isDir } }.
-// Paths that no longer exist are simply missing from it.
+// What `stat -c STAT_FORMAT -- paths...` says about each path:
+// { path: { time, size, isDir, regular } }. The kind comes from the raw mode
+// (%f), which reads the same in every language; `stat` describes a link
+// itself, never what it points to. Paths that no longer exist are simply
+// missing from it.
+var STAT_FORMAT = "%Y\t%s\t%f\t%n"
+
 function parseStat(output) {
   var out = {}
   var lines = String(output || "").split("\n")
   for (var i = 0; i < lines.length; i++) {
-    var m = lines[i].match(/^(\d+)\t(\d+)\t([^\t]+)\t(\/.*)$/)
+    var m = lines[i].match(/^(\d+)\t(\d+)\t([0-9a-f]{1,8})\t(\/.*)$/)
     if (!m || !goodPath(m[4])) continue
-    out[m[4]] = { time: Number(m[1]) * 1000, size: Number(m[2]), isDir: m[3] === "directory" }
+    var type = parseInt(m[3], 16) & 0xf000
+    out[m[4]] = { time: Number(m[1]) * 1000, size: Number(m[2]), isDir: type === 0x4000, regular: type === 0x8000 }
   }
   return out
+}
+
+// A picture Qt may open: what `stat` said is a regular file no bigger than
+// `cap`. Anything else (a link, a pipe, a device), and anything not looked
+// at yet, isn't: opening a pipe would stall the shell's picture loading.
+function pictureOk(info, cap) {
+  return !!(info && info.regular && info.size <= cap)
 }
 
 // ---- kinds and icons ---------------------------------------------------------------------

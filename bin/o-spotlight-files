@@ -12,6 +12,10 @@
 # exclusively beside it, synced, then renamed over it. Its folder is created
 # (0700) inside your home folder or your runtime folder only.
 #
+# What's read is printed as one JSON string, plain ASCII (everything else
+# escaped), so the shell can take it in as it arrives without garbling a
+# character split between two reads.
+#
 # Usage (O-Spotlight runs it as /usr/bin/python3 -I -S <this file> ...):
 #   o-spotlight-files read <name>           print one of the files in FILES
 #   o-spotlight-files history-read <dir>    print <dir>/history.json
@@ -24,9 +28,11 @@ import errno
 import json
 import os
 import pwd
+import re
 import secrets
 import stat
 import sys
+import time
 
 KIB = 1024
 MIB = 1024 * KIB
@@ -46,7 +52,11 @@ FILES = {
 }
 
 HISTORY = "history.json"
-HISTORY_CAP = 2 * MIB
+# Above the most O-Spotlight keeps (Frecency.js's limits, every key as long
+# and as far from ASCII as allowed): just under 7 MiB.
+HISTORY_CAP = 8 * MIB
+# A write's temp file: ours by its name, in our own folder.
+HISTORY_TEMP = re.compile(r"\.history\.json\.[0-9a-f]{16}\.tmp")
 
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK | os.O_NOCTTY
@@ -199,12 +209,32 @@ def history_read(folder):
         os.close(fd)
 
 
+def remove_stale_temps(fd):
+    """Temp files of writes that were stopped part way (at their deadline),
+    once they're a minute old: only names a write of ours makes, and only
+    regular files of yours."""
+    now = time.time()
+    with os.scandir(fd) as entries:
+        for entry in entries:
+            if not HISTORY_TEMP.fullmatch(entry.name):
+                continue
+            try:
+                st = entry.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISREG(st.st_mode) and st.st_uid == uid() and now - st.st_mtime > 60:
+                try:
+                    os.unlink(entry.name, dir_fd=fd)
+                except FileNotFoundError:
+                    pass
+
+
 def history_write(folder, data):
     if len(data) > HISTORY_CAP:
         raise Refused("history: bigger than %d bytes" % HISTORY_CAP)
     try:
         value = json.loads(data.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError):
+    except (UnicodeDecodeError, ValueError, RecursionError):
         raise Refused("history: not JSON")
     if not isinstance(value, dict):
         raise Refused("history: not a JSON object")
@@ -213,6 +243,7 @@ def history_write(folder, data):
     try:
         if os.fstat(fd).st_uid != uid():
             raise Refused("%s: owned by someone else" % folder)
+        remove_stale_temps(fd)
         temp = ".%s.%s.tmp" % (HISTORY, secrets.token_hex(8))
         out = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=fd)
         try:
@@ -235,6 +266,17 @@ def history_write(folder, data):
         os.close(fd)
 
 
+def as_ascii(data, cap):
+    """`data` as a JSON string in plain ASCII. Text needs at most three
+    characters out per byte in (a two-byte letter becomes \\u00e9); text that
+    needs more (control characters, broken UTF-8) is refused rather than
+    handed over six times its size."""
+    out = json.dumps(data.decode("utf-8", "replace"))
+    if len(out) > 3 * cap + 2:
+        raise Refused("too much text that needs escaping")
+    return out.encode("ascii") + b"\n"
+
+
 def read_stdin(cap):
     data = sys.stdin.buffer.read(cap + 1)
     if len(data) > cap:
@@ -249,9 +291,9 @@ def main(argv):
     command, arg = argv[1], argv[2]
     try:
         if command == "read":
-            sys.stdout.buffer.write(read_named(arg))
+            sys.stdout.buffer.write(as_ascii(read_named(arg), FILES[arg][2]))
         elif command == "history-read":
-            sys.stdout.buffer.write(history_read(arg))
+            sys.stdout.buffer.write(as_ascii(history_read(arg), HISTORY_CAP))
         else:
             history_write(arg, read_stdin(HISTORY_CAP))
         sys.stdout.flush()

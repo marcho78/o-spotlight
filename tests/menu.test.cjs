@@ -155,4 +155,46 @@ check("guard ids are plain", () => {
   assert.ok(!script.includes("x$(y)"));
 });
 
+check("a check too long to run isn't cut short: its row doesn't show", () => {
+  const long = "true; " + "x".repeat(9000);
+  const menu = JSON.stringify({
+    "tools": { "label": "Tools" },
+    "tools.short": { "label": "Short", "when": "true", "action": "a" },
+    "tools.long": { "label": "Long", "when": long, "action": "b" },
+    "tools.marked": { "label": "Marked", "checked": long, "action": "c" }
+  });
+  const merged = Menu.merge(Menu.parse(menu), []);
+  const script = Menu.guardScript(merged.items);
+  assert.ok(script.includes("tools.short:w"));
+  assert.ok(!script.includes("tools.long:") && !script.includes("tools.marked:") && !script.includes("xxxx"), "never run, whole or in part");
+  const guards = Menu.parseGuards("tools.short:w:1\n");
+  const ids = plain(Menu.entries(merged, guards)).map((e) => e.id);
+  assert.ok(ids.includes("tools.short") && ids.includes("tools.marked"));
+  assert.ok(!ids.includes("tools.long"));
+  assert.equal(plain(Menu.entries(merged, guards)).find((e) => e.id === "tools.marked").checked, false);
+});
+
+check("a menu file of any shape is read in linear time", () => {
+  // Long runs of blank lines (the comment pattern used to backtrack on them)...
+  let started = Date.now();
+  Menu.parse("{\n" + "\n".repeat(200000) + "// c\n\"a\": {\"label\": \"A\"}}");
+  assert.ok(Date.now() - started < 1000, `blank lines took ${Date.now() - started}ms`);
+  // ...and thousands of rows under one submenu.
+  const items = { "big": { label: "Big" } };
+  for (let i = 0; i < 8000; i++) items["big.m" + i] = { label: "M" + i, parent: "big", action: "x" };
+  const parsed = Menu.parse(JSON.stringify(items));
+  assert.equal(parsed.length, 5000, "at most 5000 rows a file");
+  const merged = Menu.merge(parsed, []);
+  started = Date.now();
+  const list = Menu.entries(merged, Menu.parseGuards(""));
+  assert.ok(Date.now() - started < 1000, `entries took ${Date.now() - started}ms`);
+  assert.ok(list.length > 4000);
+});
+
+check("a menu that contains itself ends", () => {
+  const items = { "a": { label: "A", parent: "b" }, "b": { label: "B", parent: "a" }, "c": { label: "C", action: "x", parent: "a" } };
+  const merged = Menu.merge(Menu.parse(JSON.stringify(items)), []);
+  assert.ok(Array.isArray(plain(Menu.entries(merged, Menu.parseGuards("")))));
+});
+
 console.log(`menu: ${passed} checks passed`);

@@ -13,7 +13,7 @@ var ENGINES = {
 }
 
 function engine(id) {
-  return ENGINES[id] || ENGINES.google
+  return Object.prototype.hasOwnProperty.call(ENGINES, id) ? ENGINES[id] : ENGINES.google
 }
 
 function searchUrl(engineId, query) {
@@ -24,10 +24,11 @@ var TLDS = "com|org|net|io|dev|app|ai|co|me|info|biz|edu|gov|xyz|sh|gg|tv|fm|us|
 
 // An address you typed, as a URL to open, or "" when it isn't one:
 // "github.com/basecamp" → "https://github.com/basecamp", "localhost:3000" → "http://localhost:3000".
+// Control characters never make an address; the scheme comes out lowercase.
 function addressUrl(query) {
   var text = String(query || "").trim()
-  if (!text || text.length > 2000 || /\s/.test(text)) return ""
-  if (/^https?:\/\/[^\s\/$.?#][^\s]*$/i.test(text)) return text
+  if (!text || text.length > 2000 || /[\s\u0000-\u001f\u007f-\u009f]/.test(text)) return ""
+  if (/^https?:\/\/[^\s\/$.?#][^\s]*$/i.test(text)) return text.replace(/^https?/i, function(scheme) { return scheme.toLowerCase() })
   if (/^(localhost|127\.0\.0\.1|\[::1\])(:\d{1,5})?(\/\S*)?$/i.test(text)) return "http://" + text
   if (/^(\d{1,3}\.){3}\d{1,3}(:\d{1,5})?(\/\S*)?$/.test(text)) return "http://" + text
   var re = new RegExp("^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+(" + TLDS + ")(:\\d{1,5})?(/\\S*)?$", "i")

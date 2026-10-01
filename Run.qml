@@ -7,15 +7,26 @@ import Quickshell.Io
 //
 // The command runs as the leader of its own process group (setsid), so a
 // deadline, an output overrun or cancel() ends it together with anything it
-// started. Output is counted as it arrives, stdout and stderr together, and
-// nothing past the budget is kept. On failure, `output` says why: the budget
-// or deadline it broke, or what the command printed on stderr.
+// started, and so does O-Spotlight unloading while it runs. Output is counted
+// in bytes as it arrives, stdout and stderr together, and nothing past the
+// budget is kept. On failure, `output` says why: the budget or deadline it
+// broke, or what the command printed on stderr.
+//
+// Output arrives in pieces as the command writes it, and each piece is turned
+// into text on its own, so a character whose bytes land in two pieces would
+// be garbled. Commands that print ASCII only (the file helper, which hands
+// files over as escaped JSON text) can be read as they come; for the rest, `splitMarker`
+// cuts stdout into whole records (fd's NUL-ended paths, `stat`'s lines)
+// before they're turned into text. A record is at most a path long, and it's
+// counted against the budget as soon as it's complete.
 //
 // replace(argv) is for searches that follow your typing: it stops the command
 // in flight (its result is never reported) and starts the new one.
 //
 // start(argv, input) hands the command `input` on stdin and closes it.
-// `environment` changes variables for the command (null unsets one).
+// `environment` changes variables for the command (null unsets one); with
+// `clearEnvironment`, the command gets those variables only (null then
+// takes the value O-Spotlight has).
 Item {
   id: run
 
@@ -25,6 +36,9 @@ Item {
   // paths were missing").
   property var okCodes: [0]
   property var environment: ({})
+  property bool clearEnvironment: false
+  // "" (pieces as they come), "\n" or "\u0000" (whole records; see above).
+  property string splitMarker: ""
   readonly property bool running: proc.running
 
   signal finished(bool ok, string output)
@@ -96,9 +110,23 @@ Item {
     _kill()
   }
 
+  // The UTF-8 bytes `text` came from.
+  function _bytes(text) {
+    if (!/[^\u0000-\u007f]/.test(text)) return text.length
+    var n = text.length
+    for (var i = 0; i < text.length; i++) {
+      var c = text.charCodeAt(i)
+      if (c >= 0x80) n += c >= 0x800 && (c < 0xd800 || c > 0xdfff) ? 2 : 1
+    }
+    return n
+  }
+
   function _take(data, isError) {
     if (_failed || _cancelled) return
-    _seen += data.length
+    // A record comes without its marker; put it back, so the output reads
+    // as the command wrote it.
+    if (!isError && splitMarker) data += splitMarker
+    _seen += _bytes(data)
     if (_seen > maxBytes) {
       _fail("printed more than " + maxBytes + " bytes")
       return
@@ -110,6 +138,8 @@ Item {
     }
   }
 
+  Component.onDestruction: if (proc.running) _kill()
+
   Timer {
     id: deadline
     interval: run.timeoutMs
@@ -119,6 +149,7 @@ Item {
   Process {
     id: proc
     environment: run.environment
+    clearEnvironment: run.clearEnvironment
     onStarted: {
       if (!run._hasInput) return
       write(run._input)
@@ -127,7 +158,7 @@ Item {
       stdinEnabled = false
     }
     stdout: SplitParser {
-      splitMarker: ""
+      splitMarker: run.splitMarker
       onRead: function(data) { run._take(data, false) }
     }
     stderr: SplitParser {

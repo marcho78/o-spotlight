@@ -2,7 +2,7 @@
 // Usage (from the plugin directory): node tests/files.test.cjs
 
 const assert = require("node:assert/strict");
-const { execFileSync } = require("node:child_process");
+const { execFileSync, spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -18,6 +18,7 @@ check("fd arguments", () => {
   const argv = plain(Files.fdArgs("tax  2024 ", { root: HOME, excludes: ["/Work/secret"], limit: 50 }));
   assert.equal(argv[0], "/usr/bin/fd");
   assert.ok(argv.includes("--fixed-strings") && argv.includes("--print0") && argv.includes("--max-results=50"));
+  assert.ok(argv.includes("--type=f") && argv.includes("--type=d"), "files and folders only");
   assert.ok(argv.includes("--exclude=node_modules") && argv.includes("--exclude=/Work/secret"));
   assert.ok(argv.includes("--and=2024"));
   assert.deepEqual(argv.slice(-3), ["--", "tax", HOME], "the pattern after --, so -x can't be an option");
@@ -72,9 +73,67 @@ check("recent files and stat", () => {
     <bookmark href="file:///home/u/Tom&amp;Jerry.txt" modified="2026-09-27T01:00:00Z"></bookmark></xbel>`;
   const recent = plain(Files.parseRecent(xml, 10));
   assert.deepEqual(recent.map((r) => r.path), ["/home/u/b c.png", "/home/u/a.txt", "/home/u/Tom&Jerry.txt"]);
-  const stat = plain(Files.parseStat("1789506874\t9\tregular file\t/etc/hostname\n1790702080\t720\tdirectory\t/home/u/Downloads\ngarbage\n"));
+  const stat = plain(Files.parseStat("1789506874\t9\t81a4\t/etc/hostname\n1790702080\t720\t41ed\t/home/u/Downloads\n1\t2\ta1ff\t/home/u/link.png\n1\t0\t11a4\t/home/u/pipe.jpg\ngarbage\n"));
   assert.equal(stat["/etc/hostname"].time, 1789506874000);
+  assert.equal(stat["/etc/hostname"].regular, true);
   assert.equal(stat["/home/u/Downloads"].isDir, true);
+  assert.equal(stat["/home/u/Downloads"].regular, false);
+  assert.equal(stat["/home/u/link.png"].regular, false, "a link is described, not followed");
+  assert.equal(stat["/home/u/pipe.jpg"].regular, false);
+});
+
+check("recent files: other tags, attribute order, entities", () => {
+  const xml = `<xbel><bookmark:applications><bookmark:application name="x"/></bookmark:applications>
+    <bookmark modified="2026-09-28T01:00:00Z" href="file:///home/u/first.txt"></bookmark>
+    <bookmark href="file:///home/u/a&amp;lt;b.txt" modified="2026-09-29T01:00:00Z"></bookmark>
+    <bookmark href="file:///home/u/no-date.txt"></bookmark>
+    <bookmarks href="file:///home/u/not-a-bookmark.txt" modified="2026-09-30T01:00:00Z"></bookmarks></xbel>`;
+  assert.deepEqual(plain(Files.parseRecent(xml, 10)).map((r) => r.path), ["/home/u/a&lt;b.txt", "/home/u/first.txt"]);
+});
+
+check("recent files are read in one pass, however the file is made", () => {
+  // A tag that never closes, over and over: the old pattern took seconds on
+  // a fraction of the 4 MiB cap.
+  const evil = ("<bookmark " + "x".repeat(20) + " href=\"file:///a\" ").repeat(200000);
+  let started = Date.now();
+  Files.parseRecent(evil, 30);
+  assert.ok(Date.now() - started < 1500, `took ${Date.now() - started}ms`);
+  const many = Array.from({ length: 20000 }, (_, i) =>
+    `<bookmark href="file:///home/u/f${i}.txt" added="x" modified="2026-09-28T01:00:${String(i % 60).padStart(2, "0")}Z" visited="x"><info/></bookmark>`).join("\n");
+  started = Date.now();
+  assert.equal(Files.parseRecent(`<xbel>${many}</xbel>`, 30).length, 30);
+  assert.ok(Date.now() - started < 1500, `took ${Date.now() - started}ms`);
+});
+
+check("pictures: only regular files under their cap", () => {
+  assert.equal(Files.pictureOk({ regular: true, size: 10 }, 100), true);
+  assert.equal(Files.pictureOk({ regular: true, size: 101 }, 100), false);
+  assert.equal(Files.pictureOk({ regular: false, size: 0 }, 100), false);
+  assert.equal(Files.pictureOk(null, 100), false, "not looked at yet");
+  assert.equal(Files.pictureOk(undefined, 100), false);
+});
+
+check("stat really runs: a pipe or a link is never a picture", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "o-spotlight-"));
+  const photo = path.join(dir, "photo.png");
+  fs.writeFileSync(photo, "x".repeat(100));
+  const pipe = path.join(dir, "holiday.jpg");
+  execFileSync("/usr/bin/mkfifo", [pipe]);
+  const link = path.join(dir, "link.png");
+  fs.symlinkSync(photo, link);
+  // `stat` exits 1 for the missing one, as O-Spotlight expects (okCodes).
+  const run = spawnSync("/usr/bin/stat", ["-c", Files.STAT_FORMAT, "--", photo, pipe, link, path.join(dir, "gone.png"), dir],
+                        { encoding: "utf8", env: { LANG: "de_DE.UTF-8", PATH: "/usr/bin" } });
+  assert.equal(run.status, 1);
+  const out = run.stdout;
+  const stats = plain(Files.parseStat(out));
+  assert.equal(Files.pictureOk(stats[photo], 1000), true);
+  assert.equal(Files.pictureOk(stats[photo], 50), false, "too big for the cap");
+  assert.equal(Files.pictureOk(stats[pipe], 1000), false, "a pipe");
+  assert.equal(Files.pictureOk(stats[link], 1000), false, "a link");
+  assert.equal(stats[path.join(dir, "gone.png")], undefined);
+  assert.equal(stats[dir].isDir, true, "in any language");
+  fs.rmSync(dir, { recursive: true });
 });
 
 check("kinds", () => {
@@ -125,6 +184,9 @@ check("fd really runs", () => {
   fs.writeFileSync(path.join(dir, "notes.txt"), "x");
   fs.mkdirSync(path.join(dir, "node_modules"));
   fs.writeFileSync(path.join(dir, "node_modules", "tax.js"), "x");
+  // Pipes and links aren't files or folders.
+  execFileSync("/usr/bin/mkfifo", [path.join(dir, "tax-pipe.jpg")]);
+  fs.symlinkSync(path.join(dir, "notes.txt"), path.join(dir, "tax-link.txt"));
   const argv = plain(Files.fdArgs("tax", { root: dir, limit: 50 }));
   const out = execFileSync(argv[0], argv.slice(1), { encoding: "utf8" });
   const found = plain(Files.parseFd(out, [], dir)).map((f) => path.relative(dir, f.path) + (f.isDir ? "/" : "")).sort();

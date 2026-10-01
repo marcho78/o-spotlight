@@ -137,6 +137,15 @@ check("web", () => {
   for (const not of ["firefox", "notes.txt", "report.pdf", "hello world.com", "", "file.md", "a.b"]) {
     assert.equal(Web.addressUrl(not), "", not);
   }
+  // The scheme comes out lowercase (only http and https are ever opened).
+  assert.equal(Web.addressUrl("HTTPS://Omarchy.org/X"), "https://Omarchy.org/X");
+  // Control characters never make an address.
+  for (const bad of ["https://a.com/\u0007x", "omarchy.org/\u001b[31m", "https://a.com/\u0085", "github.com/\u007f"]) {
+    assert.equal(Web.addressUrl(bad), "", JSON.stringify(bad));
+  }
+  // Names JavaScript knows aren't engines.
+  assert.equal(Web.searchUrl("constructor", "x"), "https://www.google.com/search?q=x");
+  assert.equal(Web.searchUrl("__proto__", "x"), "https://www.google.com/search?q=x");
 });
 
 console.log(`settings: ${passed} checks passed`);

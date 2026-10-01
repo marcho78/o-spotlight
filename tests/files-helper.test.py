@@ -182,6 +182,77 @@ try:
         assert os.listdir(elsewhere) == []
     check("refuses a state folder reached through a link", refuses_a_symlinked_state_folder)
 
+    def capture(argv):
+        import io
+        out = io.BytesIO()
+        wrapper = io.TextIOWrapper(out, encoding="ascii")
+        saved = sys.stdout
+        sys.stdout = wrapper
+        try:
+            code = helper.main(argv)
+        finally:
+            sys.stdout = saved
+        wrapper.flush()
+        wrapper.detach()
+        return code, out.getvalue()
+
+    def prints_ascii_json():
+        import json
+        text = "{\"label\": \"Caf\u00e9 \u2713 \U0001F600\"}"
+        put(menu, text.encode("utf-8"))
+        code, printed = capture(["x", "read", "user-menu"])
+        assert code == 0
+        assert printed.isascii() and printed.endswith(b"\n")
+        assert json.loads(printed) == text
+        put(menu, b"bad \xff utf-8")
+        assert json.loads(capture(["x", "read", "user-menu"])[1]) == "bad \ufffd utf-8"
+    check("prints what it read as ASCII-only JSON text", prints_ascii_json)
+
+    def refuses_text_that_would_balloon():
+        saved = helper.FILES["user-menu"]
+        helper.FILES["user-menu"] = (saved[0], saved[1], 100)
+        try:
+            put(menu, "\u00e9".encode("utf-8") * 50)
+            assert capture(["x", "read", "user-menu"])[0] == 0, "letters fit: 3 characters a byte at most"
+            put(menu, b"\x01" * 100)
+            quiet, sys.stderr = sys.stderr, open(os.devnull, "w")
+            try:
+                assert capture(["x", "read", "user-menu"])[0] == 4, "control characters would be 6 a byte"
+            finally:
+                sys.stderr.close()
+                sys.stderr = quiet
+        finally:
+            helper.FILES["user-menu"] = saved
+    check("refuses text that would balloon when escaped", refuses_text_that_would_balloon)
+
+    def refuses_deeply_nested_json():
+        raises(helper.Refused, lambda: helper.history_write(state, b"[" * 100000 + b"]" * 100000))
+        raises(helper.Refused, lambda: helper.history_write(state, b'{"a":' * 100000 + b"1" + b"}" * 100000))
+    check("refuses JSON nested too deep, without a traceback", refuses_deeply_nested_json)
+
+    def removes_stale_temps_only():
+        old = os.path.join(state, ".history.json.0123456789abcdef.tmp")
+        fresh = os.path.join(state, ".history.json.fedcba9876543210.tmp")
+        other = os.path.join(state, "notes.tmp")
+        linked = os.path.join(state, ".history.json.aaaaaaaaaaaaaaaa.tmp")
+        for path in (old, fresh, other):
+            with open(path, "w") as f:
+                f.write("x")
+        os.utime(old, (0, 0))
+        os.utime(other, (0, 0))
+        target = put("keep-me.txt", b"keep")
+        os.symlink(target, linked)
+        helper.history_write(state, b"{}\n")
+        names = sorted(os.listdir(state))
+        assert ".history.json.0123456789abcdef.tmp" not in names, "an old one goes"
+        assert ".history.json.fedcba9876543210.tmp" in names, "a recent one may be another write's"
+        assert "notes.tmp" in names, "not ours"
+        assert ".history.json.aaaaaaaaaaaaaaaa.tmp" in names, "a link, never a temp of ours"
+        assert open(target, "rb").read() == b"keep"
+        for path in (fresh, other, linked):
+            os.unlink(path)
+    check("cleans up only its own stale temp files", removes_stale_temps_only)
+
     def exit_codes():
         quiet, sys.stderr = sys.stderr, open(os.devnull, "w")
         try:
