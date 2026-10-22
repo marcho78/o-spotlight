@@ -16,6 +16,43 @@ function engine(id) {
   return Object.prototype.hasOwnProperty.call(ENGINES, id) ? ENGINES[id] : ENGINES.google
 }
 
+// Match a provider prefix at the start of a query, for example
+// "@Bing weather" -> { id: "bing", query: "weather" }.
+// Provider names are the same ids used by the Web Engine setting.
+function parseProviderQuery(query) {
+  var match = String(query || "").match(/^@([a-z0-9-]+)(?:\s+|$)([\s\S]*)$/i)
+  if (!match) return null
+  var id = match[1].toLowerCase()
+  if (!Object.prototype.hasOwnProperty.call(ENGINES, id)) return null
+  return { id: id, name: ENGINES[id].name, query: String(match[2] || "").trim() }
+}
+
+function providerChoices(query) {
+  var match = String(query || "").trim().match(/^@([a-z0-9-]*)$/i)
+  if (!match) return []
+  var prefix = match[1].toLowerCase()
+  return Object.keys(ENGINES).filter(function(id) {
+    return id.indexOf(prefix) === 0 || ENGINES[id].name.toLowerCase().indexOf(prefix) === 0
+  }).map(function(id) { return { id: id, name: ENGINES[id].name } })
+}
+
+function isProviderCommand(query) {
+  return /^\s*@/.test(String(query || ""))
+}
+
+// Rich text used only to paint the recognized provider token. All user text
+// is escaped before it is inserted into markup.
+function providerMarkup(text, accent) {
+  var value = String(text || "")
+  var escape = function(s) {
+    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/\"/g, "&quot;").replace(/'/g, "&#39;")
+  }
+  var match = value.match(/^(@[a-z0-9-]+)(?=\s|$)/i)
+  if (!match || !parseProviderQuery(match[1])) return escape(value)
+  return '<font color="' + escape(String(accent || "#0a84ff")) + '">' + escape(match[1]) + '</font>' + escape(value.slice(match[1].length))
+}
+
 function searchUrl(engineId, query) {
   return engine(engineId).url + encodeURIComponent(String(query || "").trim())
 }

@@ -6,6 +6,7 @@ import Quickshell.Hyprland
 import Quickshell.Widgets
 import qs.Commons
 import "Styles.js" as Styles
+import "Web.js" as Web
 import "Palette.js" as Palette
 // Unused here: the styles are loaded by file below, but Quickshell only
 // indexes a folder of QML that some file imports.
@@ -79,6 +80,9 @@ Item {
   readonly property string mode: engine ? engine.mode : "all"
   readonly property string scope: engine ? engine.scope : ""
   readonly property string query: engine ? engine.query : ""
+  // A recognized @provider prefix switches the input to the theme accent.
+  readonly property bool providerPrefixActive: !!Web.parseProviderQuery(field ? field.text : "")
+  readonly property real tahoeProviderTextOffset: Math.max(0, tahoeCursorMetrics.advanceWidth - tahoeField.cursorRectangle.x)
   // The look (Styles.js). Tahoe is drawn below; another style is loaded
   // from styles/, in the colors of Palette.js (your theme's, or yours).
   readonly property var styleInfo: Styles.info(settings.style)
@@ -170,6 +174,7 @@ Item {
   // its name doesn't start with what you typed, "— Beach Dusk.png".
   readonly property bool completionShown: !!topInfo && field.text !== "" && topInfo.kind !== "answer"
     && field.cursorPosition === field.text.length && field.selectedText === "" && mode === "all"
+    && !Web.isProviderCommand(field.text)
   readonly property bool completionPrefix: !!topInfo && field.text !== ""
     && topInfo.title.toLowerCase().indexOf(field.text.toLowerCase()) === 0
   readonly property string completionRemainder: completionPrefix ? topInfo.title.slice(field.text.length) : ""
@@ -203,8 +208,10 @@ Item {
 
   // Nothing to show, and what to say about it.
   readonly property bool emptyShown: !hasRows && !!engine
-    && (mode !== "all" || (query.trim() !== "" && !engine.searchingFiles && settings.web === false))
-  readonly property string emptyText: mode === "clipboard" && query.trim() === ""
+    && (Web.isProviderCommand(query) || mode !== "all" || (query.trim() !== "" && !engine.searchingFiles && settings.web === false))
+  readonly property string emptyText: Web.isProviderCommand(query)
+    ? (Web.parseProviderQuery(query) ? "No previous searches for " + Web.parseProviderQuery(query).name + "." : "No matching search provider.")
+    : mode === "clipboard" && query.trim() === ""
     ? (settings.clipboard === false ? "The Clipboard view is off in O-Spotlight's settings." : "Nothing copied yet.")
     : mode === "files" && query.trim() === "" ? "No recent files."
     : "No results found."
@@ -674,7 +681,11 @@ Item {
     if (!service || rowsModel.count === 0) return
     if (selectedIndex < 0) selectedIndex = 0
     var result = service.activate(rowsModel.get(selectedIndex).key, how || "open")
-    if (result === "close") requestClose()
+    if (result.indexOf("provider:") === 0) {
+      field.text = "@" + result.slice("provider:".length) + " "
+      field.cursorPosition = field.text.length
+      field.forceActiveFocus()
+    } else if (result === "close") requestClose()
     else if (result === "stay") flashCopied()
   }
 
@@ -724,8 +735,8 @@ Item {
       historyIndex = Math.min(engine.pastQueries.length - 1, historyIndex + 1)
       field.text = engine.pastQueries[historyIndex]
       field.selectAll()
-    } else if (key === Qt.Key_Down) select(1)
-    else if (key === Qt.Key_Up) select(-1)
+    } else if (key === Qt.Key_Down || (ctrl && key === Qt.Key_N)) select(1)
+    else if (key === Qt.Key_Up || (ctrl && key === Qt.Key_P)) select(-1)
     else if (key === Qt.Key_PageDown) select(gridView ? gridMetrics.columns * 3 : 6)
     else if (key === Qt.Key_PageUp) select(gridView ? -gridMetrics.columns * 3 : -6)
     else if (key === Qt.Key_Tab) select(1)
@@ -979,6 +990,8 @@ Item {
                 height: 32
                 readonly property var info: root.modeInfo(root.mode)
                 readonly property bool canGoBack: !!info && leadingMouse.containsMouse
+                readonly property var providerSearch: root.providerPrefixActive ? Web.parseProviderQuery(root.field.text) : null
+                readonly property string providerIcon: providerSearch ? Qt.resolvedUrl("providers/" + providerSearch.id + ".svg").toString() : ""
 
                 Rectangle {
                   anchors.fill: parent
@@ -986,10 +999,23 @@ Item {
                   color: root.controlHover
                   visible: leading.canGoBack
                 }
+                Image {
+                  anchors.centerIn: parent
+                  visible: !!leading.providerSearch
+                  width: 23
+                  height: 23
+                  source: leading.providerIcon
+                  sourceSize.width: 46
+                  sourceSize.height: 46
+                  fillMode: Image.PreserveAspectFit
+                  smooth: true
+                  mipmap: true
+                }
                 Icon {
                   anchors.centerIn: parent
                   width: 23
                   height: 23
+                  visible: !leading.providerSearch
                   name: leading.canGoBack ? "back" : leading.info ? leading.info.icon : "search"
                   color: leading.info ? root.textPrimary : root.textSecondary
                   weight: 1.9
@@ -1040,7 +1066,7 @@ Item {
                 focus: root.tahoe
                 enabled: root.tahoe
                 clip: true
-                color: root.textPrimary
+                color: root.providerPrefixActive && tahoeField.selectedText === "" ? "transparent" : root.textPrimary
                 selectionColor: Qt.rgba(root.highlight.r, root.highlight.g, root.highlight.b, 0.42)
                 selectedTextColor: root.textPrimary
                 font.family: root.uiFont
@@ -1049,6 +1075,7 @@ Item {
                 selectByMouse: true
                 maximumLength: 500
                 cursorDelegate: Rectangle {
+                  z: 2
                   width: 2
                   color: root.highlight
                   visible: tahoeField.activeFocus && tahoeField.cursorVisible && tahoeField.selectedText === ""
@@ -1067,6 +1094,26 @@ Item {
                   color: root.textTertiary
                   font: tahoeField.font
                   elide: Text.ElideRight
+                }
+
+                TextMetrics {
+                  id: tahoeCursorMetrics
+                  font: tahoeField.font
+                  text: tahoeField.text.slice(0, tahoeField.cursorPosition)
+                }
+
+                Text {
+                  x: -root.tahoeProviderTextOffset
+                  width: tahoeField.width
+                  height: tahoeField.height
+                  z: 1
+                  visible: root.providerPrefixActive && tahoeField.selectedText === ""
+                  verticalAlignment: Text.AlignVCenter
+                  text: Web.providerMarkup(tahoeField.text, root.pal.accent)
+                  textFormat: Text.RichText
+                  color: root.textPrimary
+                  font: tahoeField.font
+                  elide: Text.ElideNone
                 }
 
                 // The Top Hit, completed after what you typed, in a pill:

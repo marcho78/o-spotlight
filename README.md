@@ -27,6 +27,14 @@ as you type. Twelve distinct styles, and every one fully customizable.
   uses it). Hold Ctrl to see where a file is.
 * **Answers as you type.** `1200*3+15%`, `15% of 80`, `sqrt 2`, `2pi`,
   `10 km to mi`, `72°F`, `1 gb in mib`, `255 to hex`. Return copies the answer.
+* **Choose a web search as you type.** Type `@` to pick a provider, or narrow
+  the list with `@g`, `@bi` and similar prefixes. Choosing one inserts `@google`
+  (or the provider you chose); its logo appears beside the field. Type a query
+  and Return searches it in your default browser. Only the provider token
+  takes the theme accent. Local
+  results are hidden while the provider command is active, and earlier searches
+  for that provider can appear as suggestions. Providers match the Web Engine
+  setting (`google`, `duckduckgo`, `bing`, `brave`, `kagi`, `startpage`, `ecosia`).
 * **Learns what you pick.** Results you open move up, and what you picked for
   a word comes first when you type it again. Kept only on your computer.
 * **Browse views.** Applications as a grid (your most-used apps on top, then

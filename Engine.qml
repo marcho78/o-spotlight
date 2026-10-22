@@ -523,8 +523,9 @@ Item {
   // again at once, since what's on screen may be missing matches.
   function scheduleFiles(now) {
     var q = query.trim()
+    var providerSearch = Web.isProviderCommand(q)
     // "/pdf" picks a kind; it isn't something to look for.
-    if (!filesWanted || q.length < 2 || (mode === "all" && !scope && q.charAt(0) === "/")) {
+    if (!filesWanted || providerSearch || q.length < 2 || (mode === "all" && !scope && q.charAt(0) === "/")) {
       fileDebounce.stop()
       fileRun.cancel()
       contentRun.cancel()
@@ -954,6 +955,49 @@ Item {
 
   function searchCandidates(q) {
     var out = []
+    var providerSearch = Web.parseProviderQuery(q)
+    if (Web.isProviderCommand(q)) {
+      if (providerSearch && providerSearch.query !== "") {
+        var provider = webCandidate(q)
+        provider.score = 1000
+        out.push(provider)
+      }
+      if (providerSearch) {
+        var seenSearches = Object.create(null)
+        for (var p = 0; p < pastQueries.length; p++) {
+          var previous = Web.parseProviderQuery(pastQueries[p])
+          if (!previous || previous.id !== providerSearch.id || !previous.query) continue
+          var identity = previous.query.toLowerCase()
+          if (seenSearches[identity] || identity === providerSearch.query.toLowerCase()) continue
+          seenSearches[identity] = true
+          var matchScore = providerSearch.query ? Match.score(providerSearch.query, previous.query) : 0
+          if (providerSearch.query && matchScore === 0) continue
+          out.push({
+            key: "web-history:" + providerSearch.id + ":" + identity,
+            source: "web",
+            url: Web.searchUrl(providerSearch.id, previous.query),
+            address: false,
+            title: previous.query,
+            subtitle: "Previous search · " + providerSearch.name,
+            providerId: providerSearch.id,
+            searchQuery: previous.query,
+            score: providerSearch.query ? 650 + Math.round(matchScore / 10) - p : 900 - p
+          })
+        }
+      } else {
+        Web.providerChoices(q).forEach(function(choice, index) {
+          out.push({
+            key: "provider:" + choice.id,
+            source: "provider",
+            providerId: choice.id,
+            title: choice.name,
+            subtitle: "Search provider",
+            score: 1000 - index
+          })
+        })
+      }
+      return out
+    }
     function add(c, score) {
       var copy = {}
       for (var k in c) copy[k] = c[k]
@@ -1100,8 +1144,12 @@ Item {
   // `keepTop`: slower results for the same query arrived; don't move the Top Hit.
   function rebuild(keepTop) {
     var q = query.trim()
+    var enabledSections = Settings.enabledSections(settings)
+    // An explicit provider prefix is a direct web action, independent of the
+    // regular Web row setting and file result visibility.
+    if (Web.isProviderCommand(q)) enabledSections.other = true
     var built = null
-    if (mode === "clipboard") {
+    if (mode === "clipboard" && !Web.isProviderCommand(q)) {
       built = { rows: settings.clipboard === false ? [] : clipboardRows(q), top: "", kinds: [] }
     } else if (!q && mode !== "all") {
       built = { rows: browseRows(), top: "", kinds: [] }
@@ -1118,14 +1166,14 @@ Item {
         query: q,
         candidates: searchCandidates(q),
         answer: answer,
-        web: mode === "all" && settings.web !== false,
+        web: mode === "all" && settings.web !== false && !Web.isProviderCommand(q),
         history: history,
         now: Date.now(),
         learn: settings.learn !== false,
         pinnedTop: keepTop ? topKey : "",
-        enabled: Settings.enabledSections(settings),
-        scope: scope,
-        perKind: mode === "all" ? 6 : 60
+        enabled: enabledSections,
+        scope: Web.isProviderCommand(q) ? "" : scope,
+        perKind: Web.isProviderCommand(q) ? 60 : mode === "all" ? 6 : 60
       })
     }
     var byKey = {}
@@ -1145,14 +1193,19 @@ Item {
   }
 
   function webCandidate(q) {
-    var address = Web.addressUrl(q)
-    var engineId = settings.webEngine || "google"
+    var providerSearch = Web.parseProviderQuery(q)
+    var searchText = providerSearch ? providerSearch.query : q
+    var address = providerSearch ? "" : Web.addressUrl(q)
+    var engineId = providerSearch ? providerSearch.id : (settings.webEngine || "google")
     return {
+      key: providerSearch ? "web-provider:" + engineId + ":" + searchText : "web:" + q.trim(),
       source: "web",
-      url: address || Web.searchUrl(engineId, q),
+      url: address || Web.searchUrl(engineId, searchText),
       address: !!address,
-      title: address ? "Open “" + q + "”" : "Search the Web for “" + q + "”",
-      subtitle: address ? "Website" : Web.engine(engineId).name
+      title: address ? "Open “" + q + "”" : "Search " + Web.engine(engineId).name + " for “" + searchText + "”",
+      subtitle: address ? "Website" : Web.engine(engineId).name,
+      providerId: address ? "" : engineId,
+      searchQuery: address ? "" : searchText
     }
   }
 
@@ -1239,9 +1292,17 @@ Item {
       row.detail = convert ? c.answer.dimension : "Calculator"
       row.action = "Copy"
       row.copyable = true
+    } else if (c.source === "provider") {
+      row.iconType = "image"
+      row.iconSource = Qt.resolvedUrl("providers/" + c.providerId + ".svg").toString()
+      row.subtitle = c.subtitle
+      row.action = "Choose"
     } else if (c.source === "web") {
-      row.symbol = c.address ? "compass" : "globe"
-      row.badge = "#0a84ff"
+      if (c.address) row.symbol = "compass"
+      else {
+        row.iconType = "image"
+        row.iconSource = Qt.resolvedUrl("providers/" + (c.providerId || settings.webEngine) + ".svg").toString()
+      }
       row.subtitle = c.subtitle
       row.action = c.address ? "Open" : "Search"
     } else if (c.source === "app") {

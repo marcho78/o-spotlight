@@ -1,5 +1,6 @@
 import QtQuick
 import "../Palette.js" as Palette
+import "../Web.js" as Web
 
 // A style's search field. What you type goes to Spotlight.qml's search and
 // the keys to its keyboard handling, exactly as in Tahoe; the look is the
@@ -26,6 +27,7 @@ TextInput {
   property bool showAction: true
   property int actionSize: Math.round(font.pixelSize * 0.8)
   property string actionFont: font.family
+  property color regularTextColor: "white"
 
   readonly property real blockWidth: Math.round(font.pixelSize * 0.56)
 
@@ -36,6 +38,23 @@ TextInput {
   verticalAlignment: TextInput.AlignVCenter
   selectionColor: Palette.a(ui ? ui.pal.accent : "#7aa2f7", 0.4)
   selectedTextColor: color
+  Component.onCompleted: regularTextColor = color
+  onColorChanged: if (!ui || !ui.providerPrefixActive) regularTextColor = color
+
+  // Paint a rich text copy over the plain TextInput so only the provider token
+  // takes the accent. Selection uses TextInput's normal rendering.
+  states: [State {
+    name: "providerSearch"
+    when: !!input.ui && input.ui.providerPrefixActive && input.selectedText === ""
+    PropertyChanges { target: input; color: "transparent" }
+  }]
+
+  TextMetrics {
+    id: cursorMetrics
+    font: input.font
+    text: input.text.slice(0, input.cursorPosition)
+  }
+  readonly property real providerTextOffset: Math.max(0, cursorMetrics.advanceWidth - input.cursorRectangle.x)
 
   Keys.priority: Keys.BeforeItem
   Keys.onPressed: function(event) { if (input.ui) input.ui.handleKey(event) }
@@ -43,6 +62,7 @@ TextInput {
   onTextChanged: if (input.ui && input.ui.field === input) input.ui.fieldEdited(text)
 
   cursorDelegate: Item {
+    z: 2
     width: input.cursorStyle === "block" ? input.blockWidth : input.cursorWidth
     height: input.height
     visible: input.activeFocus && input.cursorVisible && input.selectedText === ""
@@ -78,6 +98,20 @@ TextInput {
     color: input.placeholderColor
     font: input.font
     elide: Text.ElideRight
+  }
+
+  Text {
+    x: -input.providerTextOffset
+    width: input.width
+    height: input.height
+    z: 1
+    visible: !!input.ui && input.ui.field === input && input.ui.providerPrefixActive && input.selectedText === ""
+    verticalAlignment: Text.AlignVCenter
+    text: Web.providerMarkup(input.text, input.ui ? input.ui.pal.accent : "#0a84ff")
+    textFormat: Text.RichText
+    color: input.regularTextColor
+    font: input.font
+    elide: Text.ElideNone
   }
 
   // The rest of the Top Hit's name after what you typed, and what Return does.

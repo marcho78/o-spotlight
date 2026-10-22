@@ -281,6 +281,8 @@ Item {
     key = c.key || key
     how = how || "open"
 
+    if (c.source === "provider") return "provider:" + c.providerId
+
     if (c.source === "answer") {
       copyText(c.answer.copy)
       if (how === "copy") return "stay"
@@ -289,6 +291,7 @@ Item {
     }
     if (c.source === "web") {
       if (how !== "open" || !/^https?:\/\//.test(c.url)) return ""
+      if (c.providerId && c.searchQuery) engine.rememberQuery("@" + c.providerId + " " + c.searchQuery)
       launch(["/usr/bin/uwsm-app", "--", "/usr/bin/xdg-open", c.url])
       return "close"
     }
@@ -380,8 +383,12 @@ Item {
   function searchWeb(text) {
     var q = String(text || "").trim()
     if (!q) return false
-    launch(["/usr/bin/uwsm-app", "--", "/usr/bin/xdg-open", Web.searchUrl(settings.webEngine, q)])
-    engine.rememberQuery(q)
+    var providerSearch = Web.parseProviderQuery(q)
+    var searchText = providerSearch ? providerSearch.query : q
+    if (!searchText) return false
+    var engineId = providerSearch ? providerSearch.id : settings.webEngine
+    launch(["/usr/bin/uwsm-app", "--", "/usr/bin/xdg-open", Web.searchUrl(engineId, searchText)])
+    engine.rememberQuery("@" + engineId + " " + searchText)
     return true
   }
 
